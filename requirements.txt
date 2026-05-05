@@ -1,0 +1,14 @@
+﻿numpy>=1.21.0
+opencv-python>=4.5.0
+pillow>=8.3.0
+pyyaml>=5.4.0
+torch>=1.9.0
+torchvision>=0.10.0
+timm>=0.9.16
+scipy>=1.7.0
+scikit-image>=0.18.0
+scikit-learn>=1.2.0
+albumentations>=1.4.0
+tqdm>=4.62.0
+matplotlib>=3.5.0
+
