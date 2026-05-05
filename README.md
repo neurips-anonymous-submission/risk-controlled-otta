@@ -200,14 +200,6 @@ This is a review-version code release. The goal is to provide a self-contained w
 
 The paper is currently under review. A BibTeX entry will be added after publication.
 
-```bibtex
-@inproceedings{anonymous2026riskcontrolledotta,
-  title     = {Risk-Controlled Online Test-Time Adaptation for Structured Geometric Prediction},
-  author    = {Anonymous},
-  booktitle = {Submitted to NeurIPS},
-  year      = {2026}
-}
-```
 
 ---
 
