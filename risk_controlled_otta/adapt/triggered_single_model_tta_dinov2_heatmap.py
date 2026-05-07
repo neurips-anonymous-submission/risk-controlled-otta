@@ -2,33 +2,39 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+OUTPUT_ROOT = REPO_ROOT / "output"
+
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+if str(OUTPUT_ROOT) not in sys.path:
+    sys.path.insert(0, str(OUTPUT_ROOT))
 
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data.crop_and_heatmap import (
-    SPEEDPLUS_3D_KEYPOINTS,
-    load_camera,
-)
+from data.crop_and_heatmap import SPEEDPLUS_3D_KEYPOINTS, load_camera
 from dinov2_heatmap_otta.data.dino_heatmap_dataset import (
     SpeedPlusDinoHeatmapDataset,
     generate_gaussian_heatmap_from_crop_coords,
 )
-from dinov2_heatmap_otta.eval.evaluate_dino_heatmap import (
+from dinov2_heatmap_otta.eval.evaluate_dinov2_heatmap import (
     decode_heatmap_to_keypoints,
     map_crop_coords_to_image,
     solve_pose_robust,
 )
-from dinov2_heatmap_otta.models.dino_pose_model import DinoHeatmapPoseModel
+from dinov2_heatmap_otta.models.dinov2_pose_model import DinoHeatmapPoseModel
 
 
 @dataclass
@@ -47,7 +53,13 @@ class QualityMemoryBank:
     def __len__(self) -> int:
         return len(self.entries)
 
-    def push(self, image: torch.Tensor, pseudo_heatmap: torch.Tensor, quality: float, image_name: str) -> None:
+    def push(
+        self,
+        image: torch.Tensor,
+        pseudo_heatmap: torch.Tensor,
+        quality: float,
+        image_name: str,
+    ) -> None:
         entry = QualityMemoryEntry(
             image=image.detach().cpu().clone(),
             pseudo_heatmap=pseudo_heatmap.detach().cpu().clone(),
@@ -63,22 +75,40 @@ class QualityMemoryBank:
         if entry.quality > self.entries[worst_index].quality:
             self.entries[worst_index] = entry
 
-    def sample(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]:
+    def sample(
+        self,
+        batch_size: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]:
         if len(self.entries) == 0:
             raise RuntimeError("Quality memory is empty.")
 
         qualities = np.asarray([max(item.quality, 1e-6) for item in self.entries], dtype=np.float64)
         probs = qualities / qualities.sum()
         replace = len(self.entries) < batch_size
-        indices = np.random.choice(np.arange(len(self.entries)), size=batch_size, replace=replace, p=probs)
+        indices = np.random.choice(
+            np.arange(len(self.entries)),
+            size=batch_size,
+            replace=replace,
+            p=probs,
+        )
 
         images = torch.stack([self.entries[int(index)].image for index in indices], dim=0).to(device)
         pseudo_heatmaps = torch.stack([self.entries[int(index)].pseudo_heatmap for index in indices], dim=0).to(device)
-        weights = torch.tensor([self.entries[int(index)].quality for index in indices], dtype=torch.float32, device=device)
+        weights = torch.tensor(
+            [self.entries[int(index)].quality for index in indices],
+            dtype=torch.float32,
+            device=device,
+        )
         weights = weights / weights.mean().clamp_min(1e-6)
         return images, pseudo_heatmaps, weights, indices
 
-    def update_if_better(self, indices: np.ndarray, pred_heatmaps: torch.Tensor, qualities: torch.Tensor) -> None:
+    def update_if_better(
+        self,
+        indices: np.ndarray,
+        pred_heatmaps: torch.Tensor,
+        qualities: torch.Tensor,
+    ) -> None:
         pred_heatmaps = pred_heatmaps.detach().cpu()
         qualities = qualities.detach().cpu()
         for slot, memory_index in enumerate(indices):
@@ -100,16 +130,81 @@ class QualityMemoryBank:
         }
 
 
-def load_source_model(checkpoint_path: str, device: torch.device) -> DinoHeatmapPoseModel:
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model = DinoHeatmapPoseModel(
-        model_name=checkpoint.get("model_name", "vit_base_patch16_dinov3.lvd1689m"),
-        input_size=int(checkpoint.get("input_size", 384)),
-        num_keypoints=11,
-        mid_channels=int(checkpoint.get("mid_channels", 256)),
-        num_deconv_layers=int(checkpoint.get("num_deconv_layers", 2)),
-        pretrained=False,
-    )
+# =========================
+# Checkpoint / size helpers
+# =========================
+def infer_input_size_from_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+    patch_size: int = 14,
+) -> Optional[int]:
+    pos_embed = state_dict.get("encoder.embeddings.position_embeddings", None)
+    if pos_embed is None:
+        return None
+
+    if pos_embed.ndim != 3:
+        raise ValueError(f"Unexpected position_embeddings shape: {tuple(pos_embed.shape)}")
+
+    num_tokens = int(pos_embed.shape[1])
+    num_patch_tokens = num_tokens - 1
+    if num_patch_tokens <= 0:
+        raise ValueError(f"Invalid position_embeddings shape: {tuple(pos_embed.shape)}")
+
+    grid_size = int(round(num_patch_tokens ** 0.5))
+    if grid_size * grid_size != num_patch_tokens:
+        raise ValueError(
+            f"Cannot infer square grid from position_embeddings shape: {tuple(pos_embed.shape)}"
+        )
+
+    return int(grid_size * patch_size)
+
+
+def resolve_model_sizes_from_checkpoint(
+    checkpoint: Dict,
+    state_dict: Dict[str, torch.Tensor],
+    cli_input_size: Optional[int],
+    cli_heatmap_size: Optional[int],
+) -> Tuple[int, int]:
+    inferred_input_size = infer_input_size_from_state_dict(state_dict, patch_size=14)
+    meta_input_size = checkpoint.get("input_size", None)
+    meta_heatmap_size = checkpoint.get("heatmap_size", None)
+
+    if inferred_input_size is not None and meta_input_size is not None:
+        if int(inferred_input_size) != int(meta_input_size):
+            print(
+                f"[tta][warn] checkpoint metadata input_size={meta_input_size}, "
+                f"but inferred from position_embeddings={inferred_input_size}. "
+                f"Using inferred value."
+            )
+
+    resolved_input_size = inferred_input_size
+    if resolved_input_size is None:
+        resolved_input_size = int(meta_input_size) if meta_input_size is not None else 384
+
+    if cli_input_size is not None and int(cli_input_size) != int(resolved_input_size):
+        raise ValueError(
+            f"CLI --input_size={cli_input_size} does not match resolved checkpoint "
+            f"input_size={resolved_input_size}."
+        )
+
+    resolved_heatmap_size = int(meta_heatmap_size) if meta_heatmap_size is not None else 96
+    if cli_heatmap_size is not None:
+        if meta_heatmap_size is not None and int(cli_heatmap_size) != int(meta_heatmap_size):
+            raise ValueError(
+                f"CLI --heatmap_size={cli_heatmap_size} does not match checkpoint "
+                f"heatmap_size={meta_heatmap_size}."
+            )
+        resolved_heatmap_size = int(cli_heatmap_size)
+
+    return int(resolved_input_size), int(resolved_heatmap_size)
+
+
+def load_source_model(
+    checkpoint_path: str,
+    device: torch.device,
+    cli_input_size: Optional[int] = None,
+    cli_heatmap_size: Optional[int] = None,
+) -> Tuple[DinoHeatmapPoseModel, int, int, Dict]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     if "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
@@ -118,35 +213,81 @@ def load_source_model(checkpoint_path: str, device: torch.device) -> DinoHeatmap
     else:
         state_dict = checkpoint
 
+    resolved_input_size, resolved_heatmap_size = resolve_model_sizes_from_checkpoint(
+        checkpoint=checkpoint,
+        state_dict=state_dict,
+        cli_input_size=cli_input_size,
+        cli_heatmap_size=cli_heatmap_size,
+    )
+
+    print(
+        f"[triggered_tta] resolved input_size={resolved_input_size}, "
+        f"heatmap_size={resolved_heatmap_size}"
+    )
+
+    model = DinoHeatmapPoseModel(
+        input_size=resolved_input_size,
+        output_heatmap_size=resolved_heatmap_size,
+        num_keypoints=11,
+        mid_channels=int(checkpoint.get("mid_channels", 256)),
+        num_deconv_layers=int(checkpoint.get("num_deconv_layers", 2)),
+        pretrained=False,
+    )
+
     model.load_state_dict(state_dict, strict=True)
-    return model.to(device)
+    return model.to(device), resolved_input_size, resolved_heatmap_size, checkpoint
 
 
-def make_dataset(args, split: str) -> SpeedPlusDinoHeatmapDataset:
+def make_dataset(
+    args,
+    split: str,
+    resolved_input_size: int,
+    resolved_heatmap_size: int,
+) -> SpeedPlusDinoHeatmapDataset:
     return SpeedPlusDinoHeatmapDataset(
         data_root=args.data_root,
         split=split,
-        input_size=args.input_size,
-        heatmap_size=args.heatmap_size,
+        input_size=resolved_input_size,
+        heatmap_size=resolved_heatmap_size,
         heatmap_sigma=args.heatmap_sigma,
         use_source_augmentation=False,
     )
 
 
-def configure_trainable_parameters(model: DinoHeatmapPoseModel, update_scope: str) -> List[torch.nn.Parameter]:
+def configure_trainable_parameters(
+    model: DinoHeatmapPoseModel,
+    update_scope: str,
+) -> List[torch.nn.Parameter]:
     for param in model.parameters():
         param.requires_grad = False
 
     for param in model.decoder.parameters():
         param.requires_grad = True
 
-    if update_scope == "decoder_last_block":
-        blocks = getattr(model.encoder, "blocks", None)
-        if blocks is None or len(blocks) == 0:
-            raise ValueError("update_scope=decoder_last_block requires encoder.blocks.")
-        for param in blocks[-1].parameters():
+    if update_scope == "decoder":
+        pass
+    elif update_scope == "decoder_last_block":
+        last_block = None
+
+        if hasattr(model.encoder, "encoder") and hasattr(model.encoder.encoder, "layer"):
+            layers = model.encoder.encoder.layer
+            if len(layers) == 0:
+                raise ValueError("encoder.encoder.layer is empty.")
+            last_block = layers[-1]
+        elif hasattr(model.encoder, "blocks"):
+            blocks = model.encoder.blocks
+            if len(blocks) == 0:
+                raise ValueError("encoder.blocks is empty.")
+            last_block = blocks[-1]
+        else:
+            raise ValueError(
+                "update_scope=decoder_last_block requires either encoder.encoder.layer "
+                "or encoder.blocks in the backbone."
+            )
+
+        for param in last_block.parameters():
             param.requires_grad = True
-    elif update_scope != "decoder":
+    else:
         raise ValueError(f"Unsupported update_scope: {update_scope}")
 
     return [param for param in model.parameters() if param.requires_grad]
@@ -191,6 +332,7 @@ def diagnose_prediction(
     crop_coords = crop_coords_hm[0].copy()
     crop_coords[:, 0] = crop_coords[:, 0] / float(hm_w) * float(input_size)
     crop_coords[:, 1] = crop_coords[:, 1] / float(hm_h) * float(input_size)
+
     image_coords = map_crop_coords_to_image(
         crop_coords,
         bbox,
@@ -223,6 +365,7 @@ def diagnose_prediction(
             "used_fallback_epnp": True,
             "mean_reprojection_error": float("inf"),
             "solvepnp_error": str(exc),
+            "num_selected_points": 0,
         }
         pose_failed = True
 
@@ -278,7 +421,7 @@ def geometry_target_from_pose(
     camera_matrix: np.ndarray,
     dist_coeffs: np.ndarray,
     device: torch.device,
-) -> torch.Tensor | None:
+) -> Optional[torch.Tensor]:
     if rvec is None or tvec is None:
         return None
 
@@ -290,16 +433,19 @@ def geometry_target_from_pose(
         distCoeffs=dist_coeffs.astype(np.float64),
     )
     image_coords = projected.reshape(-1, 2).astype(np.float64)
+
     x1, y1, x2, y2 = bbox
     crop_coords = image_coords.copy()
     crop_coords[:, 0] = (crop_coords[:, 0] - x1) / max(x2 - x1, 1.0) * float(input_size)
     crop_coords[:, 1] = (crop_coords[:, 1] - y1) / max(y2 - y1, 1.0) * float(input_size)
+
     visible = (
         (crop_coords[:, 0] >= 0.0)
         & (crop_coords[:, 0] < float(input_size))
         & (crop_coords[:, 1] >= 0.0)
         & (crop_coords[:, 1] < float(input_size))
     ).astype(np.float32)
+
     if visible.sum() < 4:
         return None
 
@@ -313,14 +459,22 @@ def geometry_target_from_pose(
     return target.unsqueeze(0).to(device)
 
 
-def weighted_heatmap_mse(pred_heatmap: torch.Tensor, target_heatmap: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
+def weighted_heatmap_mse(
+    pred_heatmap: torch.Tensor,
+    target_heatmap: torch.Tensor,
+    weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     per_sample = (pred_heatmap - target_heatmap).pow(2).mean(dim=(1, 2, 3))
     if weights is None:
         return per_sample.mean()
     return (per_sample * weights).mean()
 
 
-def confidence_weighted_regularization(pred_heatmap: torch.Tensor, pseudo_heatmap: torch.Tensor, tau: float) -> torch.Tensor:
+def confidence_weighted_regularization(
+    pred_heatmap: torch.Tensor,
+    pseudo_heatmap: torch.Tensor,
+    tau: float,
+) -> torch.Tensor:
     peaks = pseudo_heatmap.detach().flatten(2).amax(dim=-1)
     weights = F.softmax(peaks / tau, dim=1).unsqueeze(-1).unsqueeze(-1)
     per_keypoint = (pred_heatmap - pseudo_heatmap.detach()).pow(2)
@@ -338,7 +492,12 @@ def maybe_push_current_sample(
 ) -> bool:
     if quality < args.memory_min_quality:
         return False
-    memory_bank.push(image.squeeze(0), heatmap.squeeze(0), quality=quality, image_name=image_name)
+    memory_bank.push(
+        image.squeeze(0),
+        heatmap.squeeze(0),
+        quality=quality,
+        image_name=image_name,
+    )
     return True
 
 
@@ -349,12 +508,15 @@ def adapt_single_trigger(
     memory_bank: QualityMemoryBank,
     current_image: torch.Tensor,
     current_pseudo: torch.Tensor,
-    geometry_target: torch.Tensor | None,
+    geometry_target: Optional[torch.Tensor],
     args,
     device: torch.device,
 ) -> Dict[str, float]:
     if len(memory_bank) > 0:
-        mem_images, mem_pseudo, mem_weights, mem_indices = memory_bank.sample(args.memory_sample_size, device)
+        mem_images, mem_pseudo, mem_weights, mem_indices = memory_bank.sample(
+            args.memory_sample_size,
+            device,
+        )
     else:
         mem_images = current_image
         mem_pseudo = current_pseudo.detach()
@@ -370,7 +532,7 @@ def adapt_single_trigger(
     model.train()
     for _ in range(args.adapt_steps):
         optimizer.zero_grad(set_to_none=True)
-        with autocast(enabled=device.type == "cuda"):
+        with autocast(device_type="cuda", enabled=device.type == "cuda"):
             mem_pred = model(mem_images)
             loss_st = weighted_heatmap_mse(mem_pred, mem_pseudo.detach(), weights=mem_weights)
 
@@ -383,12 +545,19 @@ def adapt_single_trigger(
             if args.lambda_reg > 0.0:
                 loss_reg = confidence_weighted_regularization(mem_pred, mem_pseudo, tau=args.tau)
 
-            total_loss = args.lambda_self_training * loss_st + args.lambda_geo * loss_geo + args.lambda_reg * loss_reg
+            total_loss = (
+                args.lambda_self_training * loss_st
+                + args.lambda_geo * loss_geo
+                + args.lambda_reg * loss_reg
+            )
 
         scaler.scale(total_loss).backward()
         scaler.unscale_(optimizer)
         if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group["params"]], args.grad_clip_norm)
+            torch.nn.utils.clip_grad_norm_(
+                [p for group in optimizer.param_groups for p in group["params"]],
+                args.grad_clip_norm,
+            )
         scaler.step(optimizer)
         scaler.update()
         executed_step = True
@@ -418,7 +587,19 @@ def run_triggered_single_model_tta(args) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    target_dataset = make_dataset(args, args.target_split)
+    model, resolved_input_size, resolved_heatmap_size, checkpoint = load_source_model(
+        args.source_checkpoint,
+        device=device,
+        cli_input_size=args.input_size,
+        cli_heatmap_size=args.heatmap_size,
+    )
+
+    target_dataset = make_dataset(
+        args,
+        args.target_split,
+        resolved_input_size=resolved_input_size,
+        resolved_heatmap_size=resolved_heatmap_size,
+    )
     target_loader = DataLoader(
         target_dataset,
         batch_size=1,
@@ -428,16 +609,15 @@ def run_triggered_single_model_tta(args) -> None:
     )
 
     camera_matrix, dist_coeffs = load_camera(Path(args.data_root))
-    model = load_source_model(args.source_checkpoint, device)
     trainable_params = configure_trainable_parameters(model, args.update_scope)
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-    scaler = GradScaler(enabled=device.type == "cuda")
+    scaler = GradScaler("cuda", enabled=device.type == "cuda")
     memory_bank = QualityMemoryBank(capacity=args.memory_capacity)
 
     history: List[Dict[str, object]] = []
     loss_history: List[Dict[str, object]] = []
 
-    for step, batch in enumerate(tqdm(target_loader, desc="triggered_single_model_tta"), start=1):
+    for step, batch in enumerate(tqdm(target_loader, desc="triggered_single_model_tta_dinov2"), start=1):
         if args.max_samples is not None and step > args.max_samples:
             break
 
@@ -446,13 +626,13 @@ def run_triggered_single_model_tta(args) -> None:
         image_name = tensor_image_name(batch["image_name"])
 
         model.eval()
-        with torch.no_grad(), autocast(enabled=device.type == "cuda"):
+        with torch.no_grad(), autocast(device_type="cuda", enabled=device.type == "cuda"):
             heatmap = model(image)
 
         diagnosis = diagnose_prediction(
             heatmap=heatmap,
             bbox=bbox,
-            input_size=args.input_size,
+            input_size=resolved_input_size,
             camera_matrix=camera_matrix,
             dist_coeffs=dist_coeffs,
             args=args,
@@ -474,18 +654,20 @@ def run_triggered_single_model_tta(args) -> None:
             "loss_geometry": 0.0,
             "loss_regularization": 0.0,
         }
+
         if bool(diagnosis["triggered"]) and len(memory_bank) >= args.min_memory_for_update:
             geometry_target = geometry_target_from_pose(
                 diagnosis["rvec"],
                 diagnosis["tvec"],
                 bbox=bbox,
-                input_size=args.input_size,
+                input_size=resolved_input_size,
                 heatmap_size=heatmap.shape[-1],
                 heatmap_sigma=args.heatmap_sigma,
                 camera_matrix=camera_matrix,
                 dist_coeffs=dist_coeffs,
                 device=device,
             )
+
             losses = adapt_single_trigger(
                 model=model,
                 optimizer=optimizer,
@@ -530,23 +712,32 @@ def run_triggered_single_model_tta(args) -> None:
         "trigger_ratio": float(sum(1 for item in history if item["triggered"]) / max(len(history), 1)),
         "adapt_ratio": float(sum(1 for item in history if item["adapted"]) / max(len(history), 1)),
         "num_pushed_to_memory": int(sum(1 for item in history if item["pushed_to_memory"])),
+        "resolved_input_size": resolved_input_size,
+        "resolved_heatmap_size": resolved_heatmap_size,
         "update_scope": args.update_scope,
         **memory_bank.summary(),
     }
 
     with (output_dir / "trigger_history.json").open("w", encoding="utf-8") as handle:
-        json.dump({"summary": summary, "history": history, "loss_history": loss_history}, handle, indent=2)
+        json.dump(
+            {
+                "summary": summary,
+                "history": history,
+                "loss_history": loss_history,
+            },
+            handle,
+            indent=2,
+        )
 
     torch.save(
         {
             "model_state_dict": model.state_dict(),
-            "model_name": args.model_name,
-            "input_size": args.input_size,
-            "heatmap_size": args.heatmap_size,
+            "input_size": resolved_input_size,
+            "heatmap_size": resolved_heatmap_size,
             "heatmap_sigma": args.heatmap_sigma,
             "mid_channels": args.mid_channels,
             "num_deconv_layers": args.num_deconv_layers,
-            "adaptation": "triggered_single_model_tta",
+            "adaptation": "triggered_single_model_tta_dinov2",
             "update_scope": args.update_scope,
             "summary": summary,
         },
@@ -560,14 +751,19 @@ def parse_args():
     parser.add_argument("--data_root", type=str, default="speedplusv2")
     parser.add_argument("--source_checkpoint", type=str, required=True)
     parser.add_argument("--target_split", type=str, default="sunlamp")
-    parser.add_argument("--output_dir", type=str, default="output/dinov3_heatmap_triggered_single_model_tta")
-    parser.add_argument("--model_name", type=str, default="vit_base_patch16_dinov3.lvd1689m")
-    parser.add_argument("--input_size", type=int, default=384)
-    parser.add_argument("--heatmap_size", type=int, default=96)
+    parser.add_argument("--output_dir", type=str, default="output/dinov2_heatmap_triggered_single_model_tta")
+
+    parser.add_argument("--input_size", type=int, default=None)
+    parser.add_argument("--heatmap_size", type=int, default=None)
     parser.add_argument("--heatmap_sigma", type=float, default=3.0)
     parser.add_argument("--mid_channels", type=int, default=256)
     parser.add_argument("--num_deconv_layers", type=int, default=2)
-    parser.add_argument("--update_scope", type=str, choices=["decoder", "decoder_last_block"], default="decoder")
+    parser.add_argument(
+        "--update_scope",
+        type=str,
+        choices=["decoder", "decoder_last_block"],
+        default="decoder",
+    )
 
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0)

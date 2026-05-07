@@ -2,35 +2,420 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+OUTPUT_ROOT = REPO_ROOT / "output"
+
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+if str(OUTPUT_ROOT) not in sys.path:
+    sys.path.insert(0, str(OUTPUT_ROOT))
 
 import numpy as np
+import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data.crop_and_heatmap import load_camera
-from dinov2_heatmap_otta.adapt.triggered_single_model_tta_dino_heatmap import (
-    configure_trainable_parameters,
-    confidence_weighted_regularization,
-    diagnose_prediction,
-    geometry_target_from_pose,
-    load_source_model,
-    make_dataset,
-    maybe_push_current_sample,
-    tensor_bbox_to_tuple,
-    tensor_image_name,
-    weighted_heatmap_mse,
+from dinov2_heatmap_otta.eval.evaluate_dinov2_heatmap import (
+    decode_heatmap_to_keypoints,
+    map_crop_coords_to_image,
+    solve_pose_robust,
 )
-from dinov2_heatmap_otta.models.dino_pose_model import DinoHeatmapPoseModel
+from dinov2_heatmap_otta.data.dino_heatmap_dataset import (
+    SpeedPlusDinoHeatmapDataset,
+    generate_gaussian_heatmap_from_crop_coords,
+)
+from dinov2_heatmap_otta.models.dinov2_pose_model import DinoHeatmapPoseModel
 
 
+# =========================
+# Small utilities
+# =========================
+def safe_float(value, default: float = 0.0, cap: float | None = None) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        result = default
+    if not np.isfinite(result):
+        result = default if cap is None else cap
+    if cap is not None:
+        result = min(result, cap)
+    return result
+
+
+def tensor_image_name(value) -> str:
+    if isinstance(value, (list, tuple)):
+        return str(value[0])
+    return str(value)
+
+
+def tensor_bbox_to_tuple(bbox: torch.Tensor) -> Tuple[float, float, float, float]:
+    bbox_np = bbox.detach().cpu().numpy()
+    if bbox_np.ndim == 2:
+        bbox_np = bbox_np[0]
+    return tuple(float(item) for item in bbox_np.tolist())
+
+
+def weighted_heatmap_mse(
+    pred_heatmap: torch.Tensor,
+    target_heatmap: torch.Tensor,
+    weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    per_sample = (pred_heatmap - target_heatmap).pow(2).mean(dim=(1, 2, 3))
+    if weights is None:
+        return per_sample.mean()
+    return (per_sample * weights).mean()
+
+
+def confidence_weighted_regularization(
+    pred_heatmap: torch.Tensor,
+    pseudo_heatmap: torch.Tensor,
+    tau: float,
+) -> torch.Tensor:
+    peaks = pseudo_heatmap.detach().flatten(2).amax(dim=-1)
+    weights = F.softmax(peaks / tau, dim=1).unsqueeze(-1).unsqueeze(-1)
+    per_keypoint = (pred_heatmap - pseudo_heatmap.detach()).pow(2)
+    return (weights * per_keypoint).mean()
+
+
+# =========================
+# Checkpoint / size helpers
+# =========================
+def infer_input_size_from_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+    patch_size: int = 14,
+) -> Optional[int]:
+    pos_embed = state_dict.get("encoder.embeddings.position_embeddings", None)
+    if pos_embed is None:
+        return None
+
+    if pos_embed.ndim != 3:
+        raise ValueError(f"Unexpected position_embeddings shape: {tuple(pos_embed.shape)}")
+
+    num_tokens = int(pos_embed.shape[1])
+    num_patch_tokens = num_tokens - 1
+    if num_patch_tokens <= 0:
+        raise ValueError(f"Invalid position_embeddings shape: {tuple(pos_embed.shape)}")
+
+    grid_size = int(round(num_patch_tokens ** 0.5))
+    if grid_size * grid_size != num_patch_tokens:
+        raise ValueError(
+            f"Cannot infer square grid from position_embeddings shape: {tuple(pos_embed.shape)}"
+        )
+
+    return int(grid_size * patch_size)
+
+
+def resolve_model_sizes_from_checkpoint(
+    checkpoint: Dict,
+    state_dict: Dict[str, torch.Tensor],
+    cli_input_size: Optional[int],
+    cli_heatmap_size: Optional[int],
+) -> Tuple[int, int]:
+    inferred_input_size = infer_input_size_from_state_dict(state_dict, patch_size=14)
+    meta_input_size = checkpoint.get("input_size", None)
+    meta_heatmap_size = checkpoint.get("heatmap_size", None)
+
+    if inferred_input_size is not None and meta_input_size is not None:
+        if int(inferred_input_size) != int(meta_input_size):
+            print(
+                f"[learnable_tta][warn] checkpoint metadata input_size={meta_input_size}, "
+                f"but inferred from position_embeddings={inferred_input_size}. "
+                f"Using inferred value."
+            )
+
+    resolved_input_size = inferred_input_size
+    if resolved_input_size is None:
+        resolved_input_size = int(meta_input_size) if meta_input_size is not None else 384
+
+    if cli_input_size is not None and int(cli_input_size) != int(resolved_input_size):
+        raise ValueError(
+            f"CLI --input_size={cli_input_size} does not match resolved checkpoint "
+            f"input_size={resolved_input_size}."
+        )
+
+    resolved_heatmap_size = int(meta_heatmap_size) if meta_heatmap_size is not None else 96
+    if cli_heatmap_size is not None:
+        if meta_heatmap_size is not None and int(cli_heatmap_size) != int(meta_heatmap_size):
+            raise ValueError(
+                f"CLI --heatmap_size={cli_heatmap_size} does not match checkpoint "
+                f"heatmap_size={meta_heatmap_size}."
+            )
+        resolved_heatmap_size = int(cli_heatmap_size)
+
+    return int(resolved_input_size), int(resolved_heatmap_size)
+
+
+def load_source_model(
+    checkpoint_path: str,
+    device: torch.device,
+    cli_input_size: Optional[int] = None,
+    cli_heatmap_size: Optional[int] = None,
+) -> Tuple[DinoHeatmapPoseModel, int, int, Dict]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    if "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif "student_state_dict" in checkpoint:
+        state_dict = checkpoint["student_state_dict"]
+    else:
+        state_dict = checkpoint
+
+    resolved_input_size, resolved_heatmap_size = resolve_model_sizes_from_checkpoint(
+        checkpoint=checkpoint,
+        state_dict=state_dict,
+        cli_input_size=cli_input_size,
+        cli_heatmap_size=cli_heatmap_size,
+    )
+
+    print(
+        f"[learnable_tta] resolved input_size={resolved_input_size}, "
+        f"heatmap_size={resolved_heatmap_size}"
+    )
+
+    model = DinoHeatmapPoseModel(
+        input_size=resolved_input_size,
+        output_heatmap_size=resolved_heatmap_size,
+        num_keypoints=11,
+        mid_channels=int(checkpoint.get("mid_channels", 256)),
+        num_deconv_layers=int(checkpoint.get("num_deconv_layers", 2)),
+        pretrained=False,
+    )
+
+    model.load_state_dict(state_dict, strict=True)
+    return model.to(device), resolved_input_size, resolved_heatmap_size, checkpoint
+
+
+def make_dataset(
+    args,
+    split: str,
+    resolved_input_size: int,
+    resolved_heatmap_size: int,
+) -> SpeedPlusDinoHeatmapDataset:
+    return SpeedPlusDinoHeatmapDataset(
+        data_root=args.data_root,
+        split=split,
+        input_size=resolved_input_size,
+        heatmap_size=resolved_heatmap_size,
+        heatmap_sigma=args.heatmap_sigma,
+        use_source_augmentation=False,
+    )
+
+
+def configure_trainable_parameters(
+    model: DinoHeatmapPoseModel,
+    update_scope: str,
+) -> List[torch.nn.Parameter]:
+    for param in model.parameters():
+        param.requires_grad = False
+
+    for param in model.decoder.parameters():
+        param.requires_grad = True
+
+    if update_scope == "decoder":
+        pass
+    elif update_scope == "decoder_last_block":
+        last_block = None
+
+        if hasattr(model.encoder, "encoder") and hasattr(model.encoder.encoder, "layer"):
+            layers = model.encoder.encoder.layer
+            if len(layers) == 0:
+                raise ValueError("encoder.encoder.layer is empty.")
+            last_block = layers[-1]
+        elif hasattr(model.encoder, "blocks"):
+            blocks = model.encoder.blocks
+            if len(blocks) == 0:
+                raise ValueError("encoder.blocks is empty.")
+            last_block = blocks[-1]
+        else:
+            raise ValueError(
+                "update_scope=decoder_last_block requires either encoder.encoder.layer "
+                "or encoder.blocks in the backbone."
+            )
+
+        for param in last_block.parameters():
+            param.requires_grad = True
+    else:
+        raise ValueError(f"Unsupported update_scope: {update_scope}")
+
+    return [param for param in model.parameters() if param.requires_grad]
+
+
+# =========================
+# Diagnosis / geometry helpers
+# =========================
+def heatmap_confidence_stats(heatmap: torch.Tensor) -> Tuple[float, float]:
+    peaks = heatmap.detach().reshape(heatmap.shape[0], heatmap.shape[1], -1).amax(dim=-1)
+    return float(peaks.mean().item()), float(peaks.min().item())
+
+
+@torch.no_grad()
+def diagnose_prediction(
+    heatmap: torch.Tensor,
+    bbox: Tuple[float, float, float, float],
+    input_size: int,
+    camera_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+    args,
+) -> Dict[str, object]:
+    crop_coords_hm, confidences = decode_heatmap_to_keypoints(
+        heatmap,
+        apply_nms=not args.disable_nms,
+        nms_kernel=args.nms_kernel,
+        use_subpixel=not args.disable_subpixel,
+        subpixel_radius=args.subpixel_radius,
+    )
+
+    hm_h, hm_w = heatmap.shape[-2:]
+    crop_coords = crop_coords_hm[0].copy()
+    crop_coords[:, 0] = crop_coords[:, 0] / float(hm_w) * float(input_size)
+    crop_coords[:, 1] = crop_coords[:, 1] / float(hm_h) * float(input_size)
+
+    image_coords = map_crop_coords_to_image(
+        crop_coords,
+        bbox,
+        crop_size_w=float(input_size),
+        crop_size_h=float(input_size),
+    )
+
+    pose_debug: Dict[str, object]
+    try:
+        rvec, tvec, pose_debug = solve_pose_robust(
+            image_points=image_coords,
+            confidences=confidences[0],
+            camera_matrix=camera_matrix,
+            dist_coeffs=dist_coeffs,
+            min_confidence=args.min_confidence,
+            top_k=args.top_k,
+            min_points=args.min_points,
+            ransac_reproj_error=args.ransac_reproj_error,
+            ransac_iterations=args.ransac_iterations,
+            confidence_prob=args.ransac_confidence,
+            use_iterative_refine=not args.disable_iterative_refine,
+        )
+        pose_failed = False
+    except Exception as exc:
+        rvec = None
+        tvec = None
+        pose_debug = {
+            "selected_indices": [],
+            "ransac_inliers": [],
+            "used_fallback_epnp": True,
+            "mean_reprojection_error": float("inf"),
+            "max_reprojection_error": float("inf"),
+            "solvepnp_error": str(exc),
+            "num_selected_points": 0,
+            "tvec_norm": 0.0,
+        }
+        pose_failed = True
+
+    mean_conf, min_conf = heatmap_confidence_stats(heatmap)
+    num_selected = int(pose_debug.get("num_selected_points", len(pose_debug.get("selected_indices", []))))
+    num_inliers = int(len(pose_debug.get("ransac_inliers", [])))
+    inlier_ratio = float(num_inliers / max(num_selected, 1))
+    reproj_error = float(pose_debug.get("mean_reprojection_error", float("inf")))
+    fallback = bool(pose_debug.get("used_fallback_epnp", False))
+
+    trigger_reasons = []
+    if mean_conf < args.trigger_confidence:
+        trigger_reasons.append("low_confidence")
+    if num_inliers < args.trigger_min_inliers:
+        trigger_reasons.append("low_inliers")
+    if reproj_error > args.trigger_reprojection_error:
+        trigger_reasons.append("high_reprojection_error")
+    if fallback:
+        trigger_reasons.append("fallback_epnp")
+    if pose_failed:
+        trigger_reasons.append("pnp_failed")
+
+    reproj_quality = 1.0 / (1.0 + min(reproj_error, args.quality_reprojection_cap))
+    quality = float(max(mean_conf, 0.0) * max(inlier_ratio, 0.0) * reproj_quality)
+
+    return {
+        "rvec": rvec,
+        "tvec": tvec,
+        "crop_coords": crop_coords,
+        "image_coords": image_coords,
+        "confidences": confidences[0],
+        "mean_confidence": mean_conf,
+        "min_confidence": min_conf,
+        "num_selected_points": num_selected,
+        "num_ransac_inliers": num_inliers,
+        "inlier_ratio": inlier_ratio,
+        "mean_reprojection_error": reproj_error,
+        "max_reprojection_error": float(pose_debug.get("max_reprojection_error", reproj_error)),
+        "used_fallback_epnp": fallback,
+        "tvec_norm": float(pose_debug.get("tvec_norm", 0.0)),
+        "quality": quality,
+        "triggered": bool(trigger_reasons),
+        "trigger_reasons": trigger_reasons,
+        **pose_debug,
+    }
+
+
+def geometry_target_from_pose(
+    rvec,
+    tvec,
+    bbox: Tuple[float, float, float, float],
+    input_size: int,
+    heatmap_size: int,
+    heatmap_sigma: float,
+    camera_matrix: np.ndarray,
+    dist_coeffs: np.ndarray,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if rvec is None or tvec is None:
+        return None
+
+    from data.crop_and_heatmap import SPEEDPLUS_3D_KEYPOINTS
+
+    projected, _ = cv2.projectPoints(
+        objectPoints=SPEEDPLUS_3D_KEYPOINTS.astype(np.float64),
+        rvec=np.asarray(rvec, dtype=np.float64),
+        tvec=np.asarray(tvec, dtype=np.float64),
+        cameraMatrix=camera_matrix.astype(np.float64),
+        distCoeffs=dist_coeffs.astype(np.float64),
+    )
+    image_coords = projected.reshape(-1, 2).astype(np.float64)
+
+    x1, y1, x2, y2 = bbox
+    crop_coords = image_coords.copy()
+    crop_coords[:, 0] = (crop_coords[:, 0] - x1) / max(x2 - x1, 1.0) * float(input_size)
+    crop_coords[:, 1] = (crop_coords[:, 1] - y1) / max(y2 - y1, 1.0) * float(input_size)
+
+    visible = (
+        (crop_coords[:, 0] >= 0.0)
+        & (crop_coords[:, 0] < float(input_size))
+        & (crop_coords[:, 1] >= 0.0)
+        & (crop_coords[:, 1] < float(input_size))
+    ).astype(np.float32)
+
+    if visible.sum() < 4:
+        return None
+
+    target = generate_gaussian_heatmap_from_crop_coords(
+        keypoints=crop_coords.astype(np.float32),
+        visible=visible,
+        input_size=input_size,
+        heatmap_size=heatmap_size,
+        sigma=heatmap_sigma,
+    )
+    return target.unsqueeze(0).to(device)
+
+
+# =========================
+# Memory bank
+# =========================
 @dataclass
 class FeatureMemoryEntry:
     image: torch.Tensor
@@ -72,22 +457,40 @@ class FeatureQualityMemoryBank:
         if entry.quality > self.entries[worst_index].quality:
             self.entries[worst_index] = entry
 
-    def sample(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]:
+    def sample(
+        self,
+        batch_size: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]:
         if len(self.entries) == 0:
             raise RuntimeError("Feature memory is empty.")
 
         qualities = np.asarray([max(item.quality, 1e-6) for item in self.entries], dtype=np.float64)
         probs = qualities / qualities.sum()
         replace = len(self.entries) < batch_size
-        indices = np.random.choice(np.arange(len(self.entries)), size=batch_size, replace=replace, p=probs)
+        indices = np.random.choice(
+            np.arange(len(self.entries)),
+            size=batch_size,
+            replace=replace,
+            p=probs,
+        )
 
         images = torch.stack([self.entries[int(index)].image for index in indices], dim=0).to(device)
         pseudo_heatmaps = torch.stack([self.entries[int(index)].pseudo_heatmap for index in indices], dim=0).to(device)
-        weights = torch.tensor([self.entries[int(index)].quality for index in indices], dtype=torch.float32, device=device)
+        weights = torch.tensor(
+            [self.entries[int(index)].quality for index in indices],
+            dtype=torch.float32,
+            device=device,
+        )
         weights = weights / weights.mean().clamp_min(1e-6)
         return images, pseudo_heatmaps, weights, indices
 
-    def update_if_better(self, indices: np.ndarray, pred_heatmaps: torch.Tensor, qualities: torch.Tensor) -> None:
+    def update_if_better(
+        self,
+        indices: np.ndarray,
+        pred_heatmaps: torch.Tensor,
+        qualities: torch.Tensor,
+    ) -> None:
         pred_heatmaps = pred_heatmaps.detach().cpu()
         qualities = qualities.detach().cpu()
         for slot, memory_index in enumerate(indices):
@@ -97,8 +500,13 @@ class FeatureQualityMemoryBank:
                 self.entries[index].pseudo_heatmap = pred_heatmaps[slot].clone()
                 self.entries[index].quality = quality
 
-    def feature_distances(self, feature: torch.Tensor, source_prototype: torch.Tensor | None) -> torch.Tensor:
+    def feature_distances(
+        self,
+        feature: torch.Tensor,
+        source_prototype: torch.Tensor | None,
+    ) -> torch.Tensor:
         feature = F.normalize(feature.detach().flatten(), dim=0).cpu()
+
         if source_prototype is None:
             source_distance = torch.tensor(0.0)
         else:
@@ -127,6 +535,9 @@ class FeatureQualityMemoryBank:
         }
 
 
+# =========================
+# Gate networks
+# =========================
 class GeoRiskMLP(nn.Module):
     def __init__(self, input_dim: int = 8, hidden_dim: int = 16) -> None:
         super().__init__()
@@ -169,23 +580,20 @@ def make_gate(args, device: torch.device) -> nn.Module | None:
     return None
 
 
-def safe_float(value, default: float = 0.0, cap: float | None = None) -> float:
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        result = default
-    if not np.isfinite(result):
-        result = default if cap is None else cap
-    if cap is not None:
-        result = min(result, cap)
-    return result
-
-
 def build_geo_features(diagnosis: Dict[str, object], args, device: torch.device) -> torch.Tensor:
     num_inliers = safe_float(diagnosis.get("num_ransac_inliers", 0.0))
-    mean_reproj = safe_float(diagnosis.get("mean_reprojection_error", 0.0), cap=args.feature_reprojection_cap)
-    max_reproj = safe_float(diagnosis.get("max_reprojection_error", mean_reproj), cap=args.feature_reprojection_cap)
-    tvec_norm = safe_float(diagnosis.get("tvec_norm", 0.0), cap=args.feature_tvec_norm_cap)
+    mean_reproj = safe_float(
+        diagnosis.get("mean_reprojection_error", 0.0),
+        cap=args.feature_reprojection_cap,
+    )
+    max_reproj = safe_float(
+        diagnosis.get("max_reprojection_error", mean_reproj),
+        cap=args.feature_reprojection_cap,
+    )
+    tvec_norm = safe_float(
+        diagnosis.get("tvec_norm", 0.0),
+        cap=args.feature_tvec_norm_cap,
+    )
     fallback = 1.0 if diagnosis.get("used_fallback_epnp", False) else 0.0
     pnp_failed = 1.0 if "pnp_failed" in diagnosis.get("trigger_reasons", []) else 0.0
 
@@ -205,9 +613,13 @@ def build_geo_features(diagnosis: Dict[str, object], args, device: torch.device)
 def heuristic_risk_label(diagnosis: Dict[str, object], args, device: torch.device) -> torch.Tensor:
     mean_conf = safe_float(diagnosis.get("mean_confidence", 0.0))
     num_inliers = int(diagnosis.get("num_ransac_inliers", 0))
-    mean_reproj = safe_float(diagnosis.get("mean_reprojection_error", 0.0), cap=args.feature_reprojection_cap)
+    mean_reproj = safe_float(
+        diagnosis.get("mean_reprojection_error", 0.0),
+        cap=args.feature_reprojection_cap,
+    )
     fallback = bool(diagnosis.get("used_fallback_epnp", False))
     pnp_failed = "pnp_failed" in diagnosis.get("trigger_reasons", [])
+
     label = (
         mean_conf < args.trigger_confidence
         or num_inliers < args.trigger_min_inliers
@@ -219,11 +631,22 @@ def heuristic_risk_label(diagnosis: Dict[str, object], args, device: torch.devic
 
 
 @torch.no_grad()
-def build_source_prototype(model: DinoHeatmapPoseModel, args, device: torch.device) -> torch.Tensor | None:
+def build_source_prototype(
+    model: DinoHeatmapPoseModel,
+    args,
+    device: torch.device,
+    resolved_input_size: int,
+    resolved_heatmap_size: int,
+) -> torch.Tensor | None:
     if args.trigger_mode != "dual_branch" or args.prototype_max_samples == 0:
         return None
 
-    source_dataset = make_dataset(args, "train")
+    source_dataset = make_dataset(
+        args,
+        "train",
+        resolved_input_size=resolved_input_size,
+        resolved_heatmap_size=resolved_heatmap_size,
+    )
     source_loader = DataLoader(
         source_dataset,
         batch_size=args.prototype_batch_size,
@@ -237,7 +660,8 @@ def build_source_prototype(model: DinoHeatmapPoseModel, args, device: torch.devi
     model.eval()
     for batch in tqdm(source_loader, desc="build_source_prototype", leave=False):
         images = batch["image"].to(device, non_blocking=True)
-        _, cls_token = model(images, return_features=True)
+        with autocast(device_type="cuda", enabled=device.type == "cuda"):
+            _, cls_token = model(images, return_features=True)
         features.append(cls_token.detach().cpu())
         seen += images.shape[0]
         if args.prototype_max_samples is not None and seen >= args.prototype_max_samples:
@@ -245,6 +669,7 @@ def build_source_prototype(model: DinoHeatmapPoseModel, args, device: torch.devi
 
     if not features:
         return None
+
     prototype = torch.cat(features, dim=0).mean(dim=0)
     return F.normalize(prototype.flatten(), dim=0).cpu()
 
@@ -305,6 +730,9 @@ def restore_optimizer_lr(optimizer: AdamW, old_lrs) -> None:
         group["lr"] = old_lr
 
 
+# =========================
+# Adaptation
+# =========================
 def adapt_with_gate(
     model: DinoHeatmapPoseModel,
     optimizer: AdamW,
@@ -317,7 +745,10 @@ def adapt_with_gate(
     args,
     device: torch.device,
 ) -> Dict[str, float]:
-    mem_images, mem_pseudo, mem_weights, mem_indices = memory_bank.sample(args.memory_sample_size, device)
+    mem_images, mem_pseudo, mem_weights, mem_indices = memory_bank.sample(
+        args.memory_sample_size,
+        device,
+    )
 
     total_loss_value = 0.0
     loss_st_value = 0.0
@@ -329,10 +760,11 @@ def adapt_with_gate(
     for _ in range(args.adapt_steps):
         optimizer.zero_grad(set_to_none=True)
         old_lrs = None
+
         if args.gate_usage == "soft_lr":
             old_lrs = scale_optimizer_lr(optimizer, max(gate_weight, args.min_lr_gate_scale))
 
-        with autocast(enabled=device.type == "cuda"):
+        with autocast(device_type="cuda", enabled=device.type == "cuda"):
             mem_pred = model(mem_images)
             loss_st = weighted_heatmap_mse(mem_pred, mem_pseudo.detach(), weights=mem_weights)
 
@@ -345,20 +777,28 @@ def adapt_with_gate(
             if args.lambda_reg > 0.0:
                 loss_reg = confidence_weighted_regularization(mem_pred, mem_pseudo, tau=args.tau)
 
-            total_loss = args.lambda_self_training * loss_st + args.lambda_geo * loss_geo + args.lambda_reg * loss_reg
+            total_loss = (
+                args.lambda_self_training * loss_st
+                + args.lambda_geo * loss_geo
+                + args.lambda_reg * loss_reg
+            )
             if args.gate_usage == "soft_loss":
                 total_loss = total_loss * float(gate_weight)
 
         scaler.scale(total_loss).backward()
         scaler.unscale_(optimizer)
         if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group["params"]], args.grad_clip_norm)
+            torch.nn.utils.clip_grad_norm_(
+                [p for group in optimizer.param_groups for p in group["params"]],
+                args.grad_clip_norm,
+            )
         scaler.step(optimizer)
         scaler.update()
-        executed_step = True
+
         if old_lrs is not None:
             restore_optimizer_lr(optimizer, old_lrs)
 
+        executed_step = True
         total_loss_value = float(total_loss.item())
         loss_st_value = float(loss_st.item())
         loss_geo_value = float(loss_geo.item())
@@ -378,12 +818,27 @@ def adapt_with_gate(
     }
 
 
+# =========================
+# Main
+# =========================
 def run_learnable_trigger_tta(args) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    target_dataset = make_dataset(args, args.target_split)
+    model, resolved_input_size, resolved_heatmap_size, checkpoint = load_source_model(
+        args.source_checkpoint,
+        device=device,
+        cli_input_size=args.input_size,
+        cli_heatmap_size=args.heatmap_size,
+    )
+
+    target_dataset = make_dataset(
+        args,
+        args.target_split,
+        resolved_input_size=resolved_input_size,
+        resolved_heatmap_size=resolved_heatmap_size,
+    )
     target_loader = DataLoader(
         target_dataset,
         batch_size=1,
@@ -393,14 +848,25 @@ def run_learnable_trigger_tta(args) -> None:
     )
 
     camera_matrix, dist_coeffs = load_camera(Path(args.data_root))
-    model = load_source_model(args.source_checkpoint, device)
-    source_prototype = build_source_prototype(model, args, device)
+    source_prototype = build_source_prototype(
+        model,
+        args,
+        device,
+        resolved_input_size=resolved_input_size,
+        resolved_heatmap_size=resolved_heatmap_size,
+    )
+
     trainable_params = configure_trainable_parameters(model, args.update_scope)
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-    scaler = GradScaler(enabled=device.type == "cuda")
+    scaler = GradScaler("cuda", enabled=device.type == "cuda")
 
     gate = make_gate(args, device)
-    gate_optimizer = AdamW(gate.parameters(), lr=args.gate_lr, weight_decay=args.gate_weight_decay) if gate is not None else None
+    gate_optimizer = (
+        AdamW(gate.parameters(), lr=args.gate_lr, weight_decay=args.gate_weight_decay)
+        if gate is not None
+        else None
+    )
+
     memory_bank = FeatureQualityMemoryBank(capacity=args.memory_capacity)
 
     history: List[Dict[str, object]] = []
@@ -416,27 +882,33 @@ def run_learnable_trigger_tta(args) -> None:
         image_name = tensor_image_name(batch["image_name"])
 
         model.eval()
-        with torch.no_grad(), autocast(enabled=device.type == "cuda"):
+        with torch.no_grad(), autocast(device_type="cuda", enabled=device.type == "cuda"):
             heatmap, cls_token = model(image, return_features=True)
 
         diagnosis = diagnose_prediction(
             heatmap=heatmap,
             bbox=bbox,
-            input_size=args.input_size,
+            input_size=resolved_input_size,
             camera_matrix=camera_matrix,
             dist_coeffs=dist_coeffs,
             args=args,
         )
 
         geo_features = build_geo_features(diagnosis, args, device)
-        feat_features = memory_bank.feature_distances(cls_token.squeeze(0), source_prototype).to(device).unsqueeze(0)
+        feat_features = memory_bank.feature_distances(
+            cls_token.squeeze(0),
+            source_prototype,
+        ).to(device).unsqueeze(0)
         risk_label = heuristic_risk_label(diagnosis, args, device)
 
         gate_loss_value = 0.0
         if gate is not None and gate_optimizer is not None and args.train_gate:
             gate.train()
             gate_optimizer.zero_grad(set_to_none=True)
-            risk_logit = gate(geo_features.detach()) if args.trigger_mode == "mlp_geo" else gate(geo_features.detach(), feat_features.detach())
+            if args.trigger_mode == "mlp_geo":
+                risk_logit = gate(geo_features.detach())
+            else:
+                risk_logit = gate(geo_features.detach(), feat_features.detach())
             gate_loss = F.binary_cross_entropy_with_logits(risk_logit, risk_label)
             gate_loss.backward()
             gate_optimizer.step()
@@ -468,18 +940,20 @@ def run_learnable_trigger_tta(args) -> None:
             "loss_geometry": 0.0,
             "loss_regularization": 0.0,
         }
+
         if triggered and len(memory_bank) >= args.min_memory_for_update:
             geometry_target = geometry_target_from_pose(
                 diagnosis["rvec"],
                 diagnosis["tvec"],
                 bbox=bbox,
-                input_size=args.input_size,
+                input_size=resolved_input_size,
                 heatmap_size=heatmap.shape[-1],
                 heatmap_sigma=args.heatmap_sigma,
                 camera_matrix=camera_matrix,
                 dist_coeffs=dist_coeffs,
                 device=device,
             )
+
             losses = adapt_with_gate(
                 model=model,
                 optimizer=optimizer,
@@ -493,7 +967,14 @@ def run_learnable_trigger_tta(args) -> None:
                 device=device,
             )
             adapted = bool(losses.pop("executed_step", False))
-            loss_history.append({"step": step, "image_name": image_name, "gate_weight": gate_weight, **losses})
+            loss_history.append(
+                {
+                    "step": step,
+                    "image_name": image_name,
+                    "gate_weight": gate_weight,
+                    **losses,
+                }
+            )
 
         gate_record = {
             "step": step,
@@ -524,7 +1005,10 @@ def run_learnable_trigger_tta(args) -> None:
                 "num_ransac_inliers": int(diagnosis["num_ransac_inliers"]),
                 "inlier_ratio": float(diagnosis["inlier_ratio"]),
                 "mean_reprojection_error": float(diagnosis["mean_reprojection_error"]),
-                "max_reprojection_error": safe_float(diagnosis.get("max_reprojection_error", 0.0), cap=args.feature_reprojection_cap),
+                "max_reprojection_error": safe_float(
+                    diagnosis.get("max_reprojection_error", 0.0),
+                    cap=args.feature_reprojection_cap,
+                ),
                 "used_fallback_epnp": bool(diagnosis["used_fallback_epnp"]),
                 **gate_record,
                 **losses,
@@ -545,6 +1029,8 @@ def run_learnable_trigger_tta(args) -> None:
         "gate_usage": args.gate_usage,
         "update_scope": args.update_scope,
         "train_gate": bool(args.train_gate),
+        "resolved_input_size": resolved_input_size,
+        "resolved_heatmap_size": resolved_heatmap_size,
         **memory_bank.summary(),
     }
 
@@ -560,23 +1046,23 @@ def run_learnable_trigger_tta(args) -> None:
             indent=2,
         )
 
-    checkpoint = {
+    checkpoint_to_save = {
         "model_state_dict": model.state_dict(),
-        "model_name": args.model_name,
-        "input_size": args.input_size,
-        "heatmap_size": args.heatmap_size,
+        "input_size": resolved_input_size,
+        "heatmap_size": resolved_heatmap_size,
         "heatmap_sigma": args.heatmap_sigma,
         "mid_channels": args.mid_channels,
         "num_deconv_layers": args.num_deconv_layers,
-        "adaptation": "learnable_trigger_single_model_tta",
+        "adaptation": "learnable_trigger_single_model_tta_dinov2",
         "trigger_mode": args.trigger_mode,
         "gate_usage": args.gate_usage,
         "update_scope": args.update_scope,
         "summary": summary,
     }
     if gate is not None:
-        checkpoint["gate_state_dict"] = gate.state_dict()
-    torch.save(checkpoint, output_dir / "tta_final.pth")
+        checkpoint_to_save["gate_state_dict"] = gate.state_dict()
+
+    torch.save(checkpoint_to_save, output_dir / "tta_final.pth")
     print(json.dumps(summary, indent=2))
 
 
@@ -585,18 +1071,33 @@ def parse_args():
     parser.add_argument("--data_root", type=str, default="speedplusv2")
     parser.add_argument("--source_checkpoint", type=str, required=True)
     parser.add_argument("--target_split", type=str, default="sunlamp")
-    parser.add_argument("--output_dir", type=str, default="output/dinov3_heatmap_learnable_trigger_tta")
-    parser.add_argument("--model_name", type=str, default="vit_base_patch16_dinov3.lvd1689m")
-    parser.add_argument("--input_size", type=int, default=384)
-    parser.add_argument("--heatmap_size", type=int, default=96)
+    parser.add_argument("--output_dir", type=str, default="output/dinov2_heatmap_learnable_trigger_tta")
+
+    parser.add_argument("--input_size", type=int, default=None)
+    parser.add_argument("--heatmap_size", type=int, default=None)
     parser.add_argument("--heatmap_sigma", type=float, default=3.0)
     parser.add_argument("--mid_channels", type=int, default=256)
     parser.add_argument("--num_deconv_layers", type=int, default=2)
     parser.add_argument("--num_keypoints", type=int, default=11)
-    parser.add_argument("--update_scope", type=str, choices=["decoder", "decoder_last_block"], default="decoder")
+    parser.add_argument(
+        "--update_scope",
+        type=str,
+        choices=["decoder", "decoder_last_block"],
+        default="decoder",
+    )
 
-    parser.add_argument("--trigger_mode", type=str, choices=["threshold", "mlp_geo", "dual_branch", "always", "never"], default="mlp_geo")
-    parser.add_argument("--gate_usage", type=str, choices=["hard", "soft_loss", "soft_lr"], default="hard")
+    parser.add_argument(
+        "--trigger_mode",
+        type=str,
+        choices=["threshold", "mlp_geo", "dual_branch", "always", "never"],
+        default="mlp_geo",
+    )
+    parser.add_argument(
+        "--gate_usage",
+        type=str,
+        choices=["hard", "soft_loss", "soft_lr"],
+        default="hard",
+    )
     parser.add_argument("--gate_threshold", type=float, default=0.5)
     parser.add_argument("--min_soft_gate_weight", type=float, default=0.05)
     parser.add_argument("--min_lr_gate_scale", type=float, default=0.05)

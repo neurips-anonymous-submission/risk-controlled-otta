@@ -23,7 +23,6 @@ from dinov2_heatmap_otta.adapt.triggered_single_model_tta_dino_heatmap import (
     geometry_target_from_pose,
     load_source_model,
     make_dataset,
-    maybe_push_current_sample,
     tensor_bbox_to_tuple,
     tensor_image_name,
     weighted_heatmap_mse,
@@ -127,46 +126,33 @@ class FeatureQualityMemoryBank:
         }
 
 
-class GeoRiskMLP(nn.Module):
-    def __init__(self, input_dim: int = 8, hidden_dim: int = 16) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, geo_features: torch.Tensor) -> torch.Tensor:
-        return self.net(geo_features).squeeze(-1)
-
-
 class DualBranchRiskGate(nn.Module):
-    def __init__(self, geo_dim: int = 8, feat_dim: int = 3, hidden_dim: int = 16) -> None:
+    def __init__(self, geo_dim: int = 8, feat_dim: int = 3, hidden_dim: int = 32, dropout: float = 0.1) -> None:
         super().__init__()
         self.geo_branch = nn.Sequential(
             nn.Linear(geo_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim // 2, 1),
         )
         self.feat_branch = nn.Sequential(
-            nn.Linear(feat_dim, max(4, hidden_dim // 2)),
+            nn.Linear(feat_dim, max(8, hidden_dim // 2)),
             nn.ReLU(inplace=True),
-            nn.Linear(max(4, hidden_dim // 2), 1),
+            nn.Dropout(dropout),
+            nn.Linear(max(8, hidden_dim // 2), 1),
         )
-        self.fusion = nn.Linear(2, 1)
+        self.fusion = nn.Sequential(
+            nn.Linear(2, 8),
+            nn.ReLU(inplace=True),
+            nn.Linear(8, 1),
+        )
 
     def forward(self, geo_features: torch.Tensor, feat_features: torch.Tensor) -> torch.Tensor:
         geo_logit = self.geo_branch(geo_features)
         feat_logit = self.feat_branch(feat_features)
         return self.fusion(torch.cat([geo_logit, feat_logit], dim=-1)).squeeze(-1)
-
-
-def make_gate(args, device: torch.device) -> nn.Module | None:
-    if args.trigger_mode == "mlp_geo":
-        return GeoRiskMLP(hidden_dim=args.gate_hidden_dim).to(device)
-    if args.trigger_mode == "dual_branch":
-        return DualBranchRiskGate(hidden_dim=args.gate_hidden_dim).to(device)
-    return None
 
 
 def safe_float(value, default: float = 0.0, cap: float | None = None) -> float:
@@ -220,9 +206,6 @@ def heuristic_risk_label(diagnosis: Dict[str, object], args, device: torch.devic
 
 @torch.no_grad()
 def build_source_prototype(model: DinoHeatmapPoseModel, args, device: torch.device) -> torch.Tensor | None:
-    if args.trigger_mode != "dual_branch" or args.prototype_max_samples == 0:
-        return None
-
     source_dataset = make_dataset(args, "train")
     source_loader = DataLoader(
         source_dataset,
@@ -250,22 +233,11 @@ def build_source_prototype(model: DinoHeatmapPoseModel, args, device: torch.devi
 
 
 def gate_probability(
-    gate: nn.Module | None,
+    gate: nn.Module,
     geo_features: torch.Tensor,
     feat_features: torch.Tensor,
-    args,
 ) -> torch.Tensor:
-    if args.trigger_mode in {"always", "threshold"}:
-        return torch.ones(1, dtype=torch.float32, device=geo_features.device)
-    if args.trigger_mode == "never":
-        return torch.zeros(1, dtype=torch.float32, device=geo_features.device)
-    if args.trigger_mode == "mlp_geo":
-        assert gate is not None
-        return torch.sigmoid(gate(geo_features))
-    if args.trigger_mode == "dual_branch":
-        assert gate is not None
-        return torch.sigmoid(gate(geo_features, feat_features))
-    raise ValueError(f"Unsupported trigger_mode: {args.trigger_mode}")
+    return torch.sigmoid(gate(geo_features, feat_features))
 
 
 def choose_gate_decision(
@@ -274,13 +246,6 @@ def choose_gate_decision(
     risk_prob: torch.Tensor,
     args,
 ) -> Tuple[bool, float]:
-    if args.trigger_mode == "always":
-        return True, 1.0
-    if args.trigger_mode == "never":
-        return False, 0.0
-    if args.trigger_mode == "threshold":
-        weight = float(heuristic_label.item())
-        return bool(weight >= 0.5), weight
     if step <= args.gate_warmup_steps:
         weight = float(heuristic_label.item())
         return bool(weight >= 0.5), weight
@@ -311,7 +276,6 @@ def adapt_with_gate(
     scaler: GradScaler,
     memory_bank: FeatureQualityMemoryBank,
     current_image: torch.Tensor,
-    current_pseudo: torch.Tensor,
     geometry_target: torch.Tensor | None,
     gate_weight: float,
     args,
@@ -323,7 +287,6 @@ def adapt_with_gate(
     loss_st_value = 0.0
     loss_geo_value = 0.0
     loss_reg_value = 0.0
-    executed_step = False
 
     model.train()
     for _ in range(args.adapt_steps):
@@ -345,17 +308,25 @@ def adapt_with_gate(
             if args.lambda_reg > 0.0:
                 loss_reg = confidence_weighted_regularization(mem_pred, mem_pseudo, tau=args.tau)
 
-            total_loss = args.lambda_self_training * loss_st + args.lambda_geo * loss_geo + args.lambda_reg * loss_reg
+            total_loss = (
+                args.lambda_self_training * loss_st
+                + args.lambda_geo * loss_geo
+                + args.lambda_reg * loss_reg
+            )
+
             if args.gate_usage == "soft_loss":
                 total_loss = total_loss * float(gate_weight)
 
         scaler.scale(total_loss).backward()
         scaler.unscale_(optimizer)
         if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group["params"]], args.grad_clip_norm)
+            torch.nn.utils.clip_grad_norm_(
+                [p for group in optimizer.param_groups for p in group["params"]],
+                args.grad_clip_norm,
+            )
         scaler.step(optimizer)
         scaler.update()
-        executed_step = True
+
         if old_lrs is not None:
             restore_optimizer_lr(optimizer, old_lrs)
 
@@ -370,7 +341,6 @@ def adapt_with_gate(
         memory_bank.update_if_better(mem_indices, updated_mem_pred, updated_quality)
 
     return {
-        "executed_step": executed_step,
         "total_loss": total_loss_value,
         "loss_self_training": loss_st_value,
         "loss_geometry": loss_geo_value,
@@ -395,19 +365,21 @@ def run_learnable_trigger_tta(args) -> None:
     camera_matrix, dist_coeffs = load_camera(Path(args.data_root))
     model = load_source_model(args.source_checkpoint, device)
     source_prototype = build_source_prototype(model, args, device)
+
     trainable_params = configure_trainable_parameters(model, args.update_scope)
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scaler = GradScaler(enabled=device.type == "cuda")
 
-    gate = make_gate(args, device)
-    gate_optimizer = AdamW(gate.parameters(), lr=args.gate_lr, weight_decay=args.gate_weight_decay) if gate is not None else None
+    gate = DualBranchRiskGate(hidden_dim=args.gate_hidden_dim, dropout=args.gate_dropout).to(device)
+    gate_optimizer = AdamW(gate.parameters(), lr=args.gate_lr, weight_decay=args.gate_weight_decay)
+
     memory_bank = FeatureQualityMemoryBank(capacity=args.memory_capacity)
 
     history: List[Dict[str, object]] = []
     loss_history: List[Dict[str, object]] = []
     gate_history: List[Dict[str, object]] = []
 
-    for step, batch in enumerate(tqdm(target_loader, desc=f"learnable_trigger_{args.trigger_mode}"), start=1):
+    for step, batch in enumerate(tqdm(target_loader, desc="learnable_trigger_dual_branch"), start=1):
         if args.max_samples is not None and step > args.max_samples:
             break
 
@@ -432,26 +404,27 @@ def run_learnable_trigger_tta(args) -> None:
         feat_features = memory_bank.feature_distances(cls_token.squeeze(0), source_prototype).to(device).unsqueeze(0)
         risk_label = heuristic_risk_label(diagnosis, args, device)
 
-        gate_loss_value = 0.0
-        if gate is not None and gate_optimizer is not None and args.train_gate:
-            gate.train()
-            gate_optimizer.zero_grad(set_to_none=True)
-            risk_logit = gate(geo_features.detach()) if args.trigger_mode == "mlp_geo" else gate(geo_features.detach(), feat_features.detach())
-            gate_loss = F.binary_cross_entropy_with_logits(risk_logit, risk_label)
-            gate_loss.backward()
-            gate_optimizer.step()
-            gate_loss_value = float(gate_loss.item())
+        gate.train()
+        gate_optimizer.zero_grad(set_to_none=True)
+        risk_logit = gate(geo_features.detach(), feat_features.detach())
+        gate_loss = F.binary_cross_entropy_with_logits(risk_logit, risk_label)
+        gate_loss.backward()
+        gate_optimizer.step()
+        gate_loss_value = float(gate_loss.item())
 
-        if gate is not None:
-            gate.eval()
+        gate.eval()
         with torch.no_grad():
-            risk_prob = gate_probability(gate, geo_features, feat_features, args)
+            risk_prob = gate_probability(gate, geo_features, feat_features)
 
         should_adapt, gate_weight = choose_gate_decision(step, risk_label, risk_prob, args)
-        triggered = bool(should_adapt)
 
         pushed_to_memory = False
-        if float(diagnosis["quality"]) >= args.memory_min_quality:
+        if (
+            float(diagnosis["quality"]) >= args.memory_min_quality
+            and float(diagnosis["mean_confidence"]) >= args.memory_min_confidence
+            and int(diagnosis["num_ransac_inliers"]) >= args.memory_min_inliers
+            and float(diagnosis["mean_reprojection_error"]) <= args.memory_max_reproj_error
+        ):
             memory_bank.push(
                 image=image.squeeze(0),
                 pseudo_heatmap=heatmap.squeeze(0),
@@ -468,7 +441,8 @@ def run_learnable_trigger_tta(args) -> None:
             "loss_geometry": 0.0,
             "loss_regularization": 0.0,
         }
-        if triggered and len(memory_bank) >= args.min_memory_for_update:
+
+        if should_adapt and len(memory_bank) >= args.min_memory_for_update:
             geometry_target = geometry_target_from_pose(
                 diagnosis["rvec"],
                 diagnosis["tvec"],
@@ -486,13 +460,12 @@ def run_learnable_trigger_tta(args) -> None:
                 scaler=scaler,
                 memory_bank=memory_bank,
                 current_image=image,
-                current_pseudo=heatmap.detach(),
                 geometry_target=geometry_target,
                 gate_weight=gate_weight,
                 args=args,
                 device=device,
             )
-            adapted = bool(losses.pop("executed_step", False))
+            adapted = True
             loss_history.append({"step": step, "image_name": image_name, "gate_weight": gate_weight, **losses})
 
         gate_record = {
@@ -511,11 +484,9 @@ def run_learnable_trigger_tta(args) -> None:
             {
                 "step": step,
                 "image_name": image_name,
-                "trigger_mode": args.trigger_mode,
+                "trigger_mode": "dual_branch",
                 "gate_usage": args.gate_usage,
-                "triggered": triggered,
                 "heuristic_triggered": bool(risk_label.item() >= 0.5),
-                "optimizer_step_executed": adapted,
                 "adapted": adapted,
                 "pushed_to_memory": pushed_to_memory,
                 "memory_size": len(memory_bank),
@@ -535,16 +506,12 @@ def run_learnable_trigger_tta(args) -> None:
         "target_split": args.target_split,
         "source_checkpoint": args.source_checkpoint,
         "num_samples": len(history),
-        "num_triggered": int(sum(1 for item in history if item["triggered"])),
         "num_heuristic_triggered": int(sum(1 for item in history if item["heuristic_triggered"])),
         "num_adapted": int(sum(1 for item in history if item["adapted"])),
-        "trigger_ratio": float(sum(1 for item in history if item["triggered"]) / max(len(history), 1)),
-        "adapt_ratio": float(sum(1 for item in history if item["adapted"]) / max(len(history), 1)),
         "num_pushed_to_memory": int(sum(1 for item in history if item["pushed_to_memory"])),
-        "trigger_mode": args.trigger_mode,
+        "trigger_mode": "dual_branch",
         "gate_usage": args.gate_usage,
         "update_scope": args.update_scope,
-        "train_gate": bool(args.train_gate),
         **memory_bank.summary(),
     }
 
@@ -568,14 +535,13 @@ def run_learnable_trigger_tta(args) -> None:
         "heatmap_sigma": args.heatmap_sigma,
         "mid_channels": args.mid_channels,
         "num_deconv_layers": args.num_deconv_layers,
-        "adaptation": "learnable_trigger_single_model_tta",
-        "trigger_mode": args.trigger_mode,
+        "adaptation": "learnable_trigger_single_model_tta_dual_branch",
+        "trigger_mode": "dual_branch",
         "gate_usage": args.gate_usage,
         "update_scope": args.update_scope,
         "summary": summary,
+        "gate_state_dict": gate.state_dict(),
     }
-    if gate is not None:
-        checkpoint["gate_state_dict"] = gate.state_dict()
     torch.save(checkpoint, output_dir / "tta_final.pth")
     print(json.dumps(summary, indent=2))
 
@@ -584,8 +550,9 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, default="speedplusv2")
     parser.add_argument("--source_checkpoint", type=str, required=True)
-    parser.add_argument("--target_split", type=str, default="sunlamp")
-    parser.add_argument("--output_dir", type=str, default="output/dinov3_heatmap_learnable_trigger_tta")
+    parser.add_argument("--target_split", type=str, default="lightbox")
+    parser.add_argument("--output_dir", type=str, default="output/dinov3_heatmap_dual_branch_tta")
+
     parser.add_argument("--model_name", type=str, default="vit_base_patch16_dinov3.lvd1689m")
     parser.add_argument("--input_size", type=int, default=384)
     parser.add_argument("--heatmap_size", type=int, default=96)
@@ -593,41 +560,46 @@ def parse_args():
     parser.add_argument("--mid_channels", type=int, default=256)
     parser.add_argument("--num_deconv_layers", type=int, default=2)
     parser.add_argument("--num_keypoints", type=int, default=11)
-    parser.add_argument("--update_scope", type=str, choices=["decoder", "decoder_last_block"], default="decoder")
 
-    parser.add_argument("--trigger_mode", type=str, choices=["threshold", "mlp_geo", "dual_branch", "always", "never"], default="mlp_geo")
-    parser.add_argument("--gate_usage", type=str, choices=["hard", "soft_loss", "soft_lr"], default="hard")
-    parser.add_argument("--gate_threshold", type=float, default=0.5)
-    parser.add_argument("--min_soft_gate_weight", type=float, default=0.05)
-    parser.add_argument("--min_lr_gate_scale", type=float, default=0.05)
-    parser.add_argument("--gate_hidden_dim", type=int, default=16)
-    parser.add_argument("--gate_lr", type=float, default=1e-3)
-    parser.add_argument("--gate_weight_decay", type=float, default=0.0)
-    parser.add_argument("--gate_warmup_steps", type=int, default=128)
-    parser.add_argument("--train_gate", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--update_scope", type=str, choices=["decoder", "decoder_last_block"], default="decoder_last_block")
+
+    parser.add_argument("--trigger_mode", type=str, default="dual_branch")
+    parser.add_argument("--gate_usage", type=str, choices=["hard", "soft_loss", "soft_lr"], default="soft_loss")
+    parser.add_argument("--gate_threshold", type=float, default=0.6)
+    parser.add_argument("--min_soft_gate_weight", type=float, default=0.10)
+    parser.add_argument("--min_lr_gate_scale", type=float, default=0.10)
+    parser.add_argument("--gate_hidden_dim", type=int, default=32)
+    parser.add_argument("--gate_dropout", type=float, default=0.10)
+    parser.add_argument("--gate_lr", type=float, default=5e-4)
+    parser.add_argument("--gate_weight_decay", type=float, default=1e-4)
+    parser.add_argument("--gate_warmup_steps", type=int, default=512)
 
     parser.add_argument("--prototype_batch_size", type=int, default=32)
-    parser.add_argument("--prototype_max_samples", type=int, default=256)
+    parser.add_argument("--prototype_max_samples", type=int, default=512)
     parser.add_argument("--feature_reprojection_cap", type=float, default=50.0)
     parser.add_argument("--feature_tvec_norm_cap", type=float, default=20.0)
 
-    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--lr", type=float, default=2e-6)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--adapt_steps", type=int, default=1)
-    parser.add_argument("--memory_capacity", type=int, default=32)
-    parser.add_argument("--memory_sample_size", type=int, default=8)
-    parser.add_argument("--min_memory_for_update", type=int, default=4)
-    parser.add_argument("--memory_min_quality", type=float, default=0.01)
 
-    parser.add_argument("--lambda_self_training", type=float, default=1.0)
-    parser.add_argument("--lambda_geo", type=float, default=0.1)
+    parser.add_argument("--memory_capacity", type=int, default=64)
+    parser.add_argument("--memory_sample_size", type=int, default=8)
+    parser.add_argument("--min_memory_for_update", type=int, default=8)
+    parser.add_argument("--memory_min_quality", type=float, default=0.10)
+    parser.add_argument("--memory_min_confidence", type=float, default=0.35)
+    parser.add_argument("--memory_min_inliers", type=int, default=6)
+    parser.add_argument("--memory_max_reproj_error", type=float, default=10.0)
+
+    parser.add_argument("--lambda_self_training", type=float, default=0.5)
+    parser.add_argument("--lambda_geo", type=float, default=0.2)
     parser.add_argument("--lambda_reg", type=float, default=0.05)
     parser.add_argument("--tau", type=float, default=0.7)
     parser.add_argument("--grad_clip_norm", type=float, default=1.0)
 
-    parser.add_argument("--trigger_confidence", type=float, default=0.15)
-    parser.add_argument("--trigger_min_inliers", type=int, default=5)
-    parser.add_argument("--trigger_reprojection_error", type=float, default=8.0)
+    parser.add_argument("--trigger_confidence", type=float, default=0.20)
+    parser.add_argument("--trigger_min_inliers", type=int, default=6)
+    parser.add_argument("--trigger_reprojection_error", type=float, default=6.0)
     parser.add_argument("--quality_reprojection_cap", type=float, default=50.0)
 
     parser.add_argument("--nms_kernel", type=int, default=3)
