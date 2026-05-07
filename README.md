@@ -203,6 +203,13 @@ The paper is currently under review. A BibTeX entry will be added after publicat
 
 ---
 
-## License
+## Assets and Licenses
 
-The license will be specified in the final public release.
+This repository uses external datasets, pretrained models, and baseline references only under their original licenses and terms of use.
+
+- **SPEED+ dataset**: We cite the original SPEED+ paper and use the dataset under its official license and terms of use.
+- **SHIRT dataset**: We cite the original SHIRT-related paper and use the dataset under its official license and terms of use.
+- **ViTPose / DINOv2 / DINOv3**: We cite the original sources and use the official checkpoints and/or code under their released licenses and terms of use.
+- **Baselines**: Baseline methods are re-implemented by the authors unless otherwise stated.
+
+The license of this repository will be specified in the final public release.
