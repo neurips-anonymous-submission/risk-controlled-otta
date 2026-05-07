@@ -13,7 +13,7 @@ plt.rcParams['ps.fonttype'] = 42
 
 # 2. 文件路径 (请确保两个文件在同目录下)
 source_file = "sunlamp_results.json"
-trigger_file = "learnable_trigger_history (2).json"
+trigger_file = "learnable_trigger_history.json"
 
 # 3. 加载并对齐数据
 source_data_map = {}
