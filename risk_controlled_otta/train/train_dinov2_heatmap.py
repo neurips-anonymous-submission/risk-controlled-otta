@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from dinov2_heatmap_otta.data.dino_heatmap_dataset import SpeedPlusDinoHeatmapDataset
 from dinov2_heatmap_otta.losses.heatmap_loss import heatmap_mse_loss
-from dinov2_heatmap_otta.models.dino_pose_model import DinoHeatmapPoseModel
+from dinov2_heatmap_otta.models.dinov2_pose_model import DinoHeatmapPoseModel
 
 
 def build_dataloader(
@@ -128,8 +128,8 @@ def train(args):
     )
 
     model = DinoHeatmapPoseModel(
-        model_name=args.model_name,
         input_size=args.input_size,
+        output_heatmap_size=args.heatmap_size,
         num_keypoints=11,
         mid_channels=args.mid_channels,
         num_deconv_layers=args.num_deconv_layers,
@@ -147,10 +147,9 @@ def train(args):
         set_encoder_trainable(model, encoder_trainable)
         model.train()
         running_loss = 0.0
-        current_lr = optimizer.param_groups[0]["lr"]
 
         for batch in tqdm(train_loader, desc=f"train epoch {epoch + 1}", leave=False):
-            current_lr = set_learning_rate(optimizer, epoch, global_step, args.warmup_steps)
+            set_learning_rate(optimizer, epoch, global_step, args.warmup_steps)
             images = batch["image"].to(device, non_blocking=True)
             heatmaps = batch["heatmap"].to(device, non_blocking=True)
 
@@ -175,7 +174,8 @@ def train(args):
         val_loss = validate(model, val_loader, device, args)
         print(
             f"epoch={epoch + 1} train_loss={train_loss:.6f} val_loss={val_loss:.6f} "
-            f"encoder_lr={optimizer.param_groups[0]['lr']:.8f} decoder_lr={optimizer.param_groups[1]['lr']:.8f} "
+            f"encoder_lr={optimizer.param_groups[0]['lr']:.8f} "
+            f"decoder_lr={optimizer.param_groups[1]['lr']:.8f} "
             f"encoder_trainable={encoder_trainable}"
         )
 
@@ -184,7 +184,6 @@ def train(args):
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "val_loss": val_loss,
-            "model_name": args.model_name,
             "input_size": args.input_size,
             "heatmap_size": args.heatmap_size,
             "heatmap_sigma": args.heatmap_sigma,
@@ -192,6 +191,7 @@ def train(args):
             "num_deconv_layers": args.num_deconv_layers,
             "positive_weight": args.positive_weight,
             "positive_threshold": args.positive_threshold,
+            "pretrained_path": args.pretrained_path,
         }
         torch.save(checkpoint, output_dir / "last_source_dino_heatmap.pth")
         if val_loss < best_val:
@@ -203,8 +203,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, default="speedplusv2")
     parser.add_argument("--output_dir", type=str, default="output/dinov2_heatmap_source")
-    parser.add_argument("--model_name", type=str, default="vit_base_patch16_dinov3.lvd1689m")
-    parser.add_argument("--pretrained_path", type=str, default=None)
+    parser.add_argument("--pretrained_path", type=str, default="pretrained/dinov2_base/model.safetensors")
     parser.add_argument("--no_pretrained", action="store_true")
     parser.add_argument("--input_size", type=int, default=384)
     parser.add_argument("--heatmap_size", type=int, default=96)
