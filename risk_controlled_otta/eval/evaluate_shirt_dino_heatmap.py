@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -13,10 +13,8 @@ from PIL import Image
 from tqdm import tqdm
 
 from data.crop_and_heatmap import (
-    SPEEDPLUS_3D_KEYPOINTS,
     compute_expanded_bbox,
     crop_and_resize,
-    load_camera,
     normalize_image,
     project_keypoints,
     visible_keypoints_mask,
@@ -24,23 +22,130 @@ from data.crop_and_heatmap import (
 from dinov2_heatmap_otta.models.dino_pose_model import DinoHeatmapPoseModel
 
 
-def load_annotations(data_root: Path, split: str) -> Tuple[List[Dict], Path]:
-    if split in {"sunlamp", "sunlamp_test"}:
-        annotation_path = data_root / "sunlamp" / "test.json"
-        image_dir = data_root / "sunlamp" / "images"
-    elif split in {"lightbox", "lightbox_test"}:
-        annotation_path = data_root / "lightbox" / "test.json"
-        image_dir = data_root / "lightbox" / "images"
-    elif split == "validation":
-        annotation_path = data_root / "synthetic" / "validation.json"
-        image_dir = data_root / "synthetic" / "images"
-    else:
-        raise ValueError(f"Unsupported split: {split}")
+SHIRT_KEYPOINTS_3D = np.array(
+    [
+        [-0.37,   -0.385,   0.3215],
+        [-0.37,    0.385,   0.3215],
+        [ 0.37,    0.385,   0.3215],
+        [ 0.37,   -0.385,   0.3215],
+        [-0.37,   -0.264,   0.0   ],
+        [-0.37,    0.304,   0.0   ],
+        [ 0.37,    0.304,   0.0   ],
+        [ 0.37,   -0.264,   0.0   ],
+        [-0.5427,  0.4877,  0.2535],
+        [ 0.5427,  0.4877,  0.2591],
+        [ 0.305,  -0.579,   0.2515],
+    ],
+    dtype=np.float32,
+)
 
-    with annotation_path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    annotations = data if isinstance(data, list) else data["images"]
-    return annotations, image_dir
+
+def load_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_camera_from_shirt(data_root: Path) -> Tuple[np.ndarray, np.ndarray]:
+    camera_path = data_root / "camera.json"
+    cam = load_json(camera_path)
+
+    if "cameraMatrix" in cam:
+        camera_matrix = np.asarray(cam["cameraMatrix"], dtype=np.float32)
+    elif "camera_matrix" in cam:
+        camera_matrix = np.asarray(cam["camera_matrix"], dtype=np.float32)
+    elif "K" in cam:
+        camera_matrix = np.asarray(cam["K"], dtype=np.float32)
+    elif all(k in cam for k in ["fx", "fy", "ccx", "ccy"]):
+        camera_matrix = np.array(
+            [
+                [cam["fx"], 0.0, cam["ccx"]],
+                [0.0, cam["fy"], cam["ccy"]],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+    elif all(k in cam for k in ["fx", "fy", "cx", "cy"]):
+        camera_matrix = np.array(
+            [
+                [cam["fx"], 0.0, cam["cx"]],
+                [0.0, cam["fy"], cam["cy"]],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+    else:
+        raise KeyError(f"Unsupported camera.json format: {camera_path}")
+
+    if "distCoeffs" in cam:
+        dist_coeffs = np.asarray(cam["distCoeffs"], dtype=np.float32)
+    elif "dist_coeffs" in cam:
+        dist_coeffs = np.asarray(cam["dist_coeffs"], dtype=np.float32)
+    elif "distortion_coefficients" in cam:
+        dist_coeffs = np.asarray(cam["distortion_coefficients"], dtype=np.float32)
+    elif "distortion" in cam:
+        dist_coeffs = np.asarray(cam["distortion"], dtype=np.float32)
+    else:
+        dist_coeffs = np.zeros(5, dtype=np.float32)
+
+    return camera_matrix.astype(np.float64), dist_coeffs.reshape(-1).astype(np.float64)
+
+
+def parse_shirt_annotation_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "filename": entry["filename"],
+        "quaternion": np.asarray(entry["q_vbs2tango_true"], dtype=np.float64),
+        "translation": np.asarray(entry["r_Vo2To_vbs_true"], dtype=np.float64),
+    }
+
+
+def load_annotations(
+    data_root: Path,
+    roe: str,
+    domain: str,
+    val_ratio: float = 0.1,
+    seed: int = 42,
+    split: str = "val",
+) -> List[Dict[str, Any]]:
+    if roe == "all":
+        roes = ["roe1", "roe2"]
+    else:
+        roes = [roe]
+
+    records: List[Dict[str, Any]] = []
+    for roe_name in roes:
+        roe_dir = data_root / roe_name
+        ann_path = roe_dir / f"{roe_name}.json"
+        image_dir = roe_dir / domain / "images"
+
+        raw = load_json(ann_path)
+        if not isinstance(raw, list):
+            raise ValueError(f"Expected list annotation file: {ann_path}")
+
+        for item in raw:
+            parsed = parse_shirt_annotation_entry(item)
+            parsed["roe"] = roe_name
+            parsed["image_path"] = image_dir / parsed["filename"]
+            parsed["domain"] = domain
+            records.append(parsed)
+
+    rng = np.random.RandomState(seed)
+    indices = np.arange(len(records))
+    rng.shuffle(indices)
+
+    n_val = max(1, int(len(indices) * val_ratio))
+    val_idx = set(indices[:n_val].tolist())
+    train_idx = set(indices[n_val:].tolist())
+
+    if split == "val":
+        selected = [records[i] for i in range(len(records)) if i in val_idx]
+    elif split == "train":
+        selected = [records[i] for i in range(len(records)) if i in train_idx]
+    elif split == "all":
+        selected = records
+    else:
+        raise ValueError(f"Unsupported split: {split}, expected one of ['train', 'val', 'all']")
+
+    return selected
 
 
 def load_checkpoint_model(model_path: str, device: torch.device) -> DinoHeatmapPoseModel:
@@ -48,10 +153,11 @@ def load_checkpoint_model(model_path: str, device: torch.device) -> DinoHeatmapP
     model = DinoHeatmapPoseModel(
         model_name=checkpoint.get("model_name", "vit_base_patch16_dinov3.lvd1689m"),
         input_size=int(checkpoint.get("input_size", 384)),
-        num_keypoints=11,
+        num_keypoints=int(checkpoint.get("num_keypoints", 11)),
         mid_channels=int(checkpoint.get("mid_channels", 256)),
         num_deconv_layers=int(checkpoint.get("num_deconv_layers", 2)),
         pretrained=False,
+        pretrained_path=None,
     ).to(device)
 
     if "model_state_dict" in checkpoint:
@@ -155,7 +261,7 @@ def select_correspondences_by_confidence(
     top_k: int = 8,
     min_points: int = 6,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    object_points = SPEEDPLUS_3D_KEYPOINTS.astype(np.float64)
+    object_points = SHIRT_KEYPOINTS_3D.astype(np.float64)
     image_points = image_points.astype(np.float64)
     confidences = confidences.astype(np.float64)
 
@@ -294,7 +400,12 @@ def rotation_vector_to_quaternion(rotation_vector: np.ndarray) -> np.ndarray:
     return q / np.linalg.norm(q)
 
 
-def compute_metrics(pred_quaternion: np.ndarray, pred_translation: np.ndarray, gt_quaternion: np.ndarray, gt_translation: np.ndarray) -> Dict[str, float]:
+def compute_metrics(
+    pred_quaternion: np.ndarray,
+    pred_translation: np.ndarray,
+    gt_quaternion: np.ndarray,
+    gt_translation: np.ndarray,
+) -> Dict[str, float]:
     pred_quaternion = pred_quaternion / (np.linalg.norm(pred_quaternion) + 1e-12)
     gt_quaternion = gt_quaternion / (np.linalg.norm(gt_quaternion) + 1e-12)
 
@@ -318,6 +429,7 @@ def compute_metrics(pred_quaternion: np.ndarray, pred_translation: np.ndarray, g
         e_star_t_bar = e_t_bar
         e_star_q = eq
         e_star_p = ep
+
     return {
         "et": et,
         "eq": eq,
@@ -358,26 +470,47 @@ def evaluate(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model = load_checkpoint_model(args.model_path, device)
-    camera_matrix, dist_coeffs = load_camera(data_root)
-    annotations, image_dir = load_annotations(data_root, args.split)
+    camera_matrix, dist_coeffs = load_camera_from_shirt(data_root)
+    annotations = load_annotations(
+        data_root=data_root,
+        roe=args.roe,
+        domain=args.domain,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+        split=args.split,
+    )
 
     results = []
-    for index, annotation in enumerate(tqdm(annotations, desc=f"eval_{args.split}")):
-        image_path = image_dir / annotation["filename"]
+    failures = 0
+
+    for index, annotation in enumerate(tqdm(annotations, desc=f"eval_shirt_{args.split}_{args.roe}")):
+        image_path = annotation["image_path"]
         image = np.array(Image.open(image_path).convert("RGB"))
 
-        gt_quaternion = np.asarray(annotation["q_vbs2tango_true"], dtype=np.float32)
-        gt_translation = np.asarray(annotation["r_Vo2To_vbs_true"], dtype=np.float32)
+        gt_quaternion = np.asarray(annotation["quaternion"], dtype=np.float64)
+        gt_translation = np.asarray(annotation["translation"], dtype=np.float64)
+
         gt_keypoints_2d = project_keypoints(
-            SPEEDPLUS_3D_KEYPOINTS,
-            gt_quaternion,
-            gt_translation,
-            camera_matrix,
-            dist_coeffs,
+            SHIRT_KEYPOINTS_3D,
+            gt_quaternion.astype(np.float32),
+            gt_translation.astype(np.float32),
+            camera_matrix.astype(np.float32),
+            dist_coeffs.astype(np.float32),
         )
+
         visible = visible_keypoints_mask(gt_keypoints_2d, (image.shape[1], image.shape[0]))
-        bbox = compute_expanded_bbox(gt_keypoints_2d, visible, (image.shape[1], image.shape[0]), expand_ratio=1.25)
-        crop_image, gt_crop_coords = crop_and_resize(image, gt_keypoints_2d, bbox, output_size=args.input_size)
+        bbox = compute_expanded_bbox(
+            gt_keypoints_2d,
+            visible,
+            (image.shape[1], image.shape[0]),
+            expand_ratio=args.expand_ratio,
+        )
+        crop_image, gt_crop_coords = crop_and_resize(
+            image,
+            gt_keypoints_2d,
+            bbox,
+            output_size=args.input_size,
+        )
 
         image_tensor = normalize_image(crop_image).unsqueeze(0).to(device)
         with torch.no_grad():
@@ -390,126 +523,194 @@ def evaluate(args):
             use_subpixel=not args.disable_subpixel,
             subpixel_radius=args.subpixel_radius,
         )
+
         crop_coords = crop_coords_hm[0].copy()
         crop_coords[:, 0] = crop_coords[:, 0] * args.input_size / args.heatmap_size
         crop_coords[:, 1] = crop_coords[:, 1] * args.input_size / args.heatmap_size
-        image_coords = map_crop_coords_to_image(crop_coords, bbox, crop_size_w=args.input_size, crop_size_h=args.input_size)
-
-        rvec, tvec, debug = solve_pose_robust(
-            image_points=image_coords,
-            confidences=confidences[0],
-            camera_matrix=camera_matrix,
-            dist_coeffs=dist_coeffs,
-            min_confidence=args.min_confidence,
-            top_k=args.top_k,
-            min_points=args.min_points,
-            ransac_reproj_error=args.ransac_reproj_error,
-            ransac_iterations=args.ransac_iterations,
-            confidence_prob=args.ransac_confidence,
-            use_iterative_refine=not args.disable_iterative_refine,
+        image_coords = map_crop_coords_to_image(
+            crop_coords,
+            bbox,
+            crop_size_w=args.input_size,
+            crop_size_h=args.input_size,
         )
 
-        pred_quaternion = rotation_vector_to_quaternion(rvec)
-        pred_translation = tvec.reshape(-1)
-        metrics = compute_metrics(pred_quaternion, pred_translation, gt_quaternion.astype(np.float64), gt_translation.astype(np.float64))
+        try:
+            rvec, tvec, debug = solve_pose_robust(
+                image_points=image_coords,
+                confidences=confidences[0],
+                camera_matrix=camera_matrix,
+                dist_coeffs=dist_coeffs,
+                min_confidence=args.min_confidence,
+                top_k=args.top_k,
+                min_points=args.min_points,
+                ransac_reproj_error=args.ransac_reproj_error,
+                ransac_iterations=args.ransac_iterations,
+                confidence_prob=args.ransac_confidence,
+                use_iterative_refine=not args.disable_iterative_refine,
+            )
 
-        result = {
-            "image_name": annotation["filename"],
-            "quaternion_pred": pred_quaternion.tolist(),
-            "translation_pred": pred_translation.tolist(),
-            "confidences": confidences[0].tolist(),
-            **debug,
-            **metrics,
-        }
+            pred_quaternion = rotation_vector_to_quaternion(rvec)
+            pred_translation = tvec.reshape(-1)
+            metrics = compute_metrics(
+                pred_quaternion,
+                pred_translation,
+                gt_quaternion,
+                gt_translation,
+            )
+
+            result = {
+                "image_name": annotation["filename"],
+                "roe": annotation["roe"],
+                "domain": annotation["domain"],
+                "quaternion_pred": pred_quaternion.tolist(),
+                "translation_pred": pred_translation.tolist(),
+                "confidences": confidences[0].tolist(),
+                "success": True,
+                **debug,
+                **metrics,
+            }
+        except Exception as exc:
+            failures += 1
+            result = {
+                "image_name": annotation["filename"],
+                "roe": annotation["roe"],
+                "domain": annotation["domain"],
+                "confidences": confidences[0].tolist(),
+                "success": False,
+                "error": str(exc),
+                "num_selected_points": 0,
+                "ransac_inliers": [],
+                "used_fallback_epnp": True,
+                "mean_selected_confidence": float(np.mean(confidences[0])),
+                "mean_reprojection_error": float("inf"),
+                "max_reprojection_error": float("inf"),
+                "tvec_norm": float("inf"),
+                "et": float("inf"),
+                "eq": float("inf"),
+                "eq_deg": float("inf"),
+                "e_t_bar": float("inf"),
+                "ep": float("inf"),
+                "e_star_t": float("inf"),
+                "e_star_t_bar": float("inf"),
+                "e_star_q": float("inf"),
+                "e_star_p": float("inf"),
+            }
+
         results.append(result)
 
         if index < args.num_vis:
             vis = draw_keypoints(image, image_coords, confidences[0], gt_keypoints=gt_keypoints_2d)
-            vis_path = output_dir / f"vis_{annotation['filename']}"
+            vis_path = output_dir / f"vis_{annotation['roe']}_{annotation['filename']}"
             cv2.imwrite(str(vis_path), cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+
             crop_vis = draw_keypoints(crop_image, crop_coords, confidences[0], gt_keypoints=gt_crop_coords)
-            crop_vis_path = output_dir / f"crop_vis_{annotation['filename']}"
+            crop_vis_path = output_dir / f"crop_vis_{annotation['roe']}_{annotation['filename']}"
             cv2.imwrite(str(crop_vis_path), cv2.cvtColor(crop_vis, cv2.COLOR_RGB2BGR))
 
-    num_collapsed = int(sum(1 for item in results if item["e_star_p"] > args.collapse_threshold))
+    valid_results = [item for item in results if item["success"]]
+    if len(valid_results) == 0:
+        raise RuntimeError("All evaluation samples failed during pose solving.")
+
+    num_collapsed = int(sum(1 for item in valid_results if item["e_star_p"] > args.collapse_threshold))
 
     summary = {
+        "dataset": "SHIRT",
         "split": args.split,
+        "roe": args.roe,
+        "domain": args.domain,
         "model_path": args.model_path,
         "num_samples": len(results),
+        "num_success": len(valid_results),
+        "num_failures": failures,
+        "success_ratio": float(len(valid_results) / max(len(results), 1)),
         "collapse_threshold": float(args.collapse_threshold),
         "num_collapsed": num_collapsed,
-        "collapse_rate": float(num_collapsed / max(len(results), 1)),
-        "avg_et": float(np.mean([item["et"] for item in results])),
-        "median_et": float(np.median([item["et"] for item in results])),
-        "p95_et": float(np.percentile([item["et"] for item in results], 95)),
-        "max_et": float(np.max([item["et"] for item in results])),
-        "avg_eq": float(np.mean([item["eq"] for item in results])),
-        "avg_eq_deg": float(np.mean([item["eq_deg"] for item in results])),
-        "median_eq_deg": float(np.median([item["eq_deg"] for item in results])),
-        "p95_eq_deg": float(np.percentile([item["eq_deg"] for item in results], 95)),
-        "max_eq_deg": float(np.max([item["eq_deg"] for item in results])),
-        "avg_e_t_bar": float(np.mean([item["e_t_bar"] for item in results])),
-        "avg_ep": float(np.mean([item["ep"] for item in results])),
-        "p95_ep": float(np.percentile([item["ep"] for item in results], 95)),
-        "max_ep": float(np.max([item["ep"] for item in results])),
-        "avg_e_star_t": float(np.mean([item["e_star_t"] for item in results])),
-        "avg_e_star_t_bar": float(np.mean([item["e_star_t_bar"] for item in results])),
-        "avg_e_star_q": float(np.mean([item["e_star_q"] for item in results])),
-        "avg_e_star_q_deg": float(np.mean([item["e_star_q"] for item in results]) * 180.0 / np.pi),
-        "avg_e_star_p": float(np.mean([item["e_star_p"] for item in results])),
-        "p95_e_star_p": float(np.percentile([item["e_star_p"] for item in results], 95)),
-        "max_e_star_p": float(np.max([item["e_star_p"] for item in results])),
-        "avg_num_selected_points": float(np.mean([item["num_selected_points"] for item in results])),
-        "median_num_selected_points": float(np.median([item["num_selected_points"] for item in results])),
-        "p95_num_selected_points": float(np.percentile([item["num_selected_points"] for item in results], 95)),
-        "avg_num_ransac_inliers": float(np.mean([len(item["ransac_inliers"]) for item in results])),
-        "median_num_ransac_inliers": float(np.median([len(item["ransac_inliers"]) for item in results])),
-        "p95_num_ransac_inliers": float(np.percentile([len(item["ransac_inliers"]) for item in results], 95)),
-        "avg_inlier_ratio": float(np.mean([len(item["ransac_inliers"]) / max(item["num_selected_points"], 1) for item in results])),
-        "median_inlier_ratio": float(np.median([len(item["ransac_inliers"]) / max(item["num_selected_points"], 1) for item in results])),
-        "p95_inlier_ratio": float(np.percentile([len(item["ransac_inliers"]) / max(item["num_selected_points"], 1) for item in results], 95)),
-        "fallback_epnp_ratio": float(np.mean([1.0 if item["used_fallback_epnp"] else 0.0 for item in results])),
-        "avg_mean_selected_confidence": float(np.mean([item["mean_selected_confidence"] for item in results])),
-        "median_mean_selected_confidence": float(np.median([item["mean_selected_confidence"] for item in results])),
-        "p95_mean_selected_confidence": float(np.percentile([item["mean_selected_confidence"] for item in results], 95)),
-        "avg_mean_reprojection_error": float(np.mean([item["mean_reprojection_error"] for item in results])),
-        "median_mean_reprojection_error": float(np.median([item["mean_reprojection_error"] for item in results])),
-        "p95_mean_reprojection_error": float(np.percentile([item["mean_reprojection_error"] for item in results], 95)),
-        "avg_max_reprojection_error": float(np.mean([item["max_reprojection_error"] for item in results])),
-        "median_max_reprojection_error": float(np.median([item["max_reprojection_error"] for item in results])),
-        "p95_max_reprojection_error": float(np.percentile([item["max_reprojection_error"] for item in results], 95)),
-        "avg_tvec_norm": float(np.mean([item["tvec_norm"] for item in results])),
-        "median_tvec_norm": float(np.median([item["tvec_norm"] for item in results])),
-        "p95_tvec_norm": float(np.percentile([item["tvec_norm"] for item in results], 95)),
+        "collapse_rate": float(num_collapsed / max(len(valid_results), 1)),
+        
+        "avg_et": float(np.mean([item["et"] for item in valid_results])),
+        "median_et": float(np.median([item["et"] for item in valid_results])),
+        "p95_et": float(np.percentile([item["et"] for item in valid_results], 95)),
+        "max_et": float(np.max([item["et"] for item in valid_results])),
+        
+        "avg_eq": float(np.mean([item["eq"] for item in valid_results])),
+        "avg_eq_deg": float(np.mean([item["eq_deg"] for item in valid_results])),
+        "median_eq_deg": float(np.median([item["eq_deg"] for item in valid_results])),
+        "p95_eq_deg": float(np.percentile([item["eq_deg"] for item in valid_results], 95)),
+        
+        "avg_e_t_bar": float(np.mean([item["e_t_bar"] for item in valid_results])),
+        "avg_ep": float(np.mean([item["ep"] for item in valid_results])),
+        
+        "avg_e_star_t": float(np.mean([item["e_star_t"] for item in valid_results])),
+        "p95_e_star_t": float(np.percentile([item["e_star_t"] for item in valid_results], 95)),
+        "max_e_star_t": float(np.max([item["e_star_t"] for item in valid_results])),
+        
+        "avg_e_star_t_bar": float(np.mean([item["e_star_t_bar"] for item in valid_results])),
+        
+        "avg_e_star_q": float(np.mean([item["e_star_q"] for item in valid_results])),
+        "p95_e_star_q": float(np.percentile([item["e_star_q"] for item in valid_results], 95)),
+        "max_e_star_q": float(np.max([item["e_star_q"] for item in valid_results])),
+        "avg_e_star_q_deg": float(np.mean([item["e_star_q"] for item in valid_results]) * 180.0 / np.pi),
+        
+        "avg_e_star_p": float(np.mean([item["e_star_p"] for item in valid_results])),
+        "p95_e_star_p": float(np.percentile([item["e_star_p"] for item in valid_results], 95)),
+        "max_e_star_p": float(np.max([item["e_star_p"] for item in valid_results])),
+        
+        "avg_num_selected_points": float(np.mean([item["num_selected_points"] for item in valid_results])),
+        "avg_num_ransac_inliers": float(np.mean([len(item["ransac_inliers"]) for item in valid_results])),
+        "fallback_epnp_ratio": float(np.mean([1.0 if item["used_fallback_epnp"] else 0.0 for item in valid_results])),
+        "avg_mean_selected_confidence": float(np.mean([item["mean_selected_confidence"] for item in valid_results])),
+        "avg_mean_reprojection_error": float(np.mean([item["mean_reprojection_error"] for item in valid_results])),
+        "median_mean_reprojection_error": float(np.median([item["mean_reprojection_error"] for item in valid_results])),
+        "p95_mean_reprojection_error": float(np.percentile([item["mean_reprojection_error"] for item in valid_results], 95)),
+        "avg_tvec_norm": float(np.mean([item["tvec_norm"] for item in valid_results])),
+        "p95_tvec_norm": float(np.percentile([item["tvec_norm"] for item in valid_results], 95)),
+        "expand_ratio": args.expand_ratio,
+        "min_confidence": args.min_confidence,
+        "top_k": args.top_k,
+        "min_points": args.min_points,
+        "ransac_reproj_error": args.ransac_reproj_error,
+        "subpixel_radius": args.subpixel_radius,
     }
 
     with (output_dir / f"{args.split}_results.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
+
+    with (output_dir / f"{args.split}_per_image_results.json").open("w", encoding="utf-8") as handle:
+        json.dump(results, handle, indent=2)
+
     print(json.dumps(summary, indent=2))
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", type=str, default="speedplusv2")
+    parser.add_argument("--data_root", type=str, default="SHIRT_Dataset")
     parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--split", type=str, default="validation")
-    parser.add_argument("--output_dir", type=str, default="evaluation_results_dino_heatmap")
+    parser.add_argument("--roe", type=str, choices=["roe1", "roe2", "all"], default="all")
+    parser.add_argument("--domain", type=str, default="synthetic")
+    parser.add_argument("--split", type=str, choices=["train", "val", "all"], default="val")
+    parser.add_argument("--val_ratio", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output_dir", type=str, default="evaluation_results_shirt_dino_heatmap")
+
     parser.add_argument("--input_size", type=int, default=384)
     parser.add_argument("--heatmap_size", type=int, default=96)
+    parser.add_argument("--expand_ratio", type=float, default=1.25)
+
     parser.add_argument("--num_vis", type=int, default=20)
     parser.add_argument("--nms_kernel", type=int, default=3)
     parser.add_argument("--disable_nms", action="store_true")
     parser.add_argument("--disable_subpixel", action="store_true")
     parser.add_argument("--subpixel_radius", type=int, default=2)
+
     parser.add_argument("--min_confidence", type=float, default=0.05)
     parser.add_argument("--top_k", type=int, default=8)
     parser.add_argument("--min_points", type=int, default=6)
     parser.add_argument("--ransac_reproj_error", type=float, default=6.0)
     parser.add_argument("--ransac_iterations", type=int, default=100)
     parser.add_argument("--ransac_confidence", type=float, default=0.999)
-    parser.add_argument("--collapse_threshold", type=float, default=0.1)
     parser.add_argument("--disable_iterative_refine", action="store_true")
+    parser.add_argument("--collapse_threshold", type=float, default=0.1)
+
     parser.add_argument("--no_cuda", action="store_true")
     return parser.parse_args()
 

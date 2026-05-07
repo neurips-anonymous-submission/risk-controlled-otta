@@ -2,8 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+OUTPUT_ROOT = REPO_ROOT / "output"
+
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+if str(OUTPUT_ROOT) not in sys.path:
+    sys.path.insert(0, str(OUTPUT_ROOT))
 
 import cv2
 import numpy as np
@@ -21,7 +30,7 @@ from data.crop_and_heatmap import (
     project_keypoints,
     visible_keypoints_mask,
 )
-from dinov2_heatmap_otta.models.dino_pose_model import DinoHeatmapPoseModel
+from dinov2_heatmap_otta.models.dinov2_pose_model import DinoHeatmapPoseModel
 
 
 def load_annotations(data_root: Path, split: str) -> Tuple[List[Dict], Path]:
@@ -43,16 +52,78 @@ def load_annotations(data_root: Path, split: str) -> Tuple[List[Dict], Path]:
     return annotations, image_dir
 
 
-def load_checkpoint_model(model_path: str, device: torch.device) -> DinoHeatmapPoseModel:
-    checkpoint = torch.load(model_path, map_location=device)
-    model = DinoHeatmapPoseModel(
-        model_name=checkpoint.get("model_name", "vit_base_patch16_dinov3.lvd1689m"),
-        input_size=int(checkpoint.get("input_size", 384)),
-        num_keypoints=11,
-        mid_channels=int(checkpoint.get("mid_channels", 256)),
-        num_deconv_layers=int(checkpoint.get("num_deconv_layers", 2)),
-        pretrained=False,
-    ).to(device)
+def infer_input_size_from_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+    patch_size: int = 14,
+) -> Optional[int]:
+    pos_embed = state_dict.get("encoder.embeddings.position_embeddings", None)
+    if pos_embed is None:
+        return None
+
+    if pos_embed.ndim != 3:
+        raise ValueError(f"Unexpected position_embeddings shape: {tuple(pos_embed.shape)}")
+
+    num_tokens = int(pos_embed.shape[1])
+    num_patch_tokens = num_tokens - 1
+    if num_patch_tokens <= 0:
+        raise ValueError(f"Invalid position_embeddings shape: {tuple(pos_embed.shape)}")
+
+    grid_size = int(round(num_patch_tokens ** 0.5))
+    if grid_size * grid_size != num_patch_tokens:
+        raise ValueError(
+            f"Cannot infer square grid from position_embeddings shape: {tuple(pos_embed.shape)}"
+        )
+
+    return int(grid_size * patch_size)
+
+
+def resolve_model_sizes(
+    checkpoint: Dict,
+    state_dict: Dict[str, torch.Tensor],
+    cli_input_size: Optional[int],
+    cli_heatmap_size: Optional[int],
+) -> Tuple[int, int]:
+    inferred_input_size = infer_input_size_from_state_dict(state_dict, patch_size=14)
+    meta_input_size = checkpoint.get("input_size", None)
+    meta_heatmap_size = checkpoint.get("heatmap_size", None)
+
+    if inferred_input_size is not None and meta_input_size is not None:
+        if int(inferred_input_size) != int(meta_input_size):
+            print(
+                f"[eval][warn] checkpoint metadata input_size={meta_input_size}, "
+                f"but inferred from position_embeddings={inferred_input_size}. "
+                f"Using inferred value."
+            )
+
+    resolved_input_size = inferred_input_size
+    if resolved_input_size is None:
+        resolved_input_size = int(meta_input_size) if meta_input_size is not None else 384
+
+    if cli_input_size is not None and int(cli_input_size) != int(resolved_input_size):
+        raise ValueError(
+            f"CLI --input_size={cli_input_size} does not match resolved checkpoint "
+            f"input_size={resolved_input_size}."
+        )
+
+    resolved_heatmap_size = int(meta_heatmap_size) if meta_heatmap_size is not None else 96
+    if cli_heatmap_size is not None:
+        if meta_heatmap_size is not None and int(cli_heatmap_size) != int(meta_heatmap_size):
+            raise ValueError(
+                f"CLI --heatmap_size={cli_heatmap_size} does not match checkpoint "
+                f"heatmap_size={meta_heatmap_size}."
+            )
+        resolved_heatmap_size = int(cli_heatmap_size)
+
+    return int(resolved_input_size), int(resolved_heatmap_size)
+
+
+def load_checkpoint_model(
+    model_path: str,
+    device: torch.device,
+    cli_input_size: Optional[int] = None,
+    cli_heatmap_size: Optional[int] = None,
+) -> Tuple[DinoHeatmapPoseModel, int, int]:
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
 
     if "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
@@ -61,9 +132,30 @@ def load_checkpoint_model(model_path: str, device: torch.device) -> DinoHeatmapP
     else:
         state_dict = checkpoint
 
+    resolved_input_size, resolved_heatmap_size = resolve_model_sizes(
+        checkpoint=checkpoint,
+        state_dict=state_dict,
+        cli_input_size=cli_input_size,
+        cli_heatmap_size=cli_heatmap_size,
+    )
+
+    print(
+        f"[eval] resolved input_size={resolved_input_size}, "
+        f"heatmap_size={resolved_heatmap_size}"
+    )
+
+    model = DinoHeatmapPoseModel(
+        input_size=resolved_input_size,
+        output_heatmap_size=resolved_heatmap_size,
+        num_keypoints=11,
+        mid_channels=int(checkpoint.get("mid_channels", 256)),
+        num_deconv_layers=int(checkpoint.get("num_deconv_layers", 2)),
+        pretrained=False,
+    ).to(device)
+
     model.load_state_dict(state_dict, strict=True)
     model.eval()
-    return model
+    return model, resolved_input_size, resolved_heatmap_size
 
 
 def _refine_subpixel_from_heatmap_single(
@@ -102,12 +194,17 @@ def decode_heatmap_to_keypoints(
     subpixel_radius: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if apply_nms:
-        pooled = F.max_pool2d(heatmap, kernel_size=nms_kernel, stride=1, padding=nms_kernel // 2)
+        pooled = F.max_pool2d(
+            heatmap,
+            kernel_size=nms_kernel,
+            stride=1,
+            padding=nms_kernel // 2,
+        )
         peak_heatmap = torch.where(heatmap == pooled, heatmap, torch.zeros_like(heatmap))
     else:
         peak_heatmap = heatmap
 
-    batch_size, num_keypoints, hm_h, hm_w = peak_heatmap.shape
+    batch_size, num_keypoints, _, hm_w = peak_heatmap.shape
     flat = peak_heatmap.view(batch_size, num_keypoints, -1)
     confidences, indices = flat.max(dim=-1)
     ys = (indices // hm_w).float()
@@ -294,7 +391,12 @@ def rotation_vector_to_quaternion(rotation_vector: np.ndarray) -> np.ndarray:
     return q / np.linalg.norm(q)
 
 
-def compute_metrics(pred_quaternion: np.ndarray, pred_translation: np.ndarray, gt_quaternion: np.ndarray, gt_translation: np.ndarray) -> Dict[str, float]:
+def compute_metrics(
+    pred_quaternion: np.ndarray,
+    pred_translation: np.ndarray,
+    gt_quaternion: np.ndarray,
+    gt_translation: np.ndarray,
+) -> Dict[str, float]:
     pred_quaternion = pred_quaternion / (np.linalg.norm(pred_quaternion) + 1e-12)
     gt_quaternion = gt_quaternion / (np.linalg.norm(gt_quaternion) + 1e-12)
 
@@ -318,6 +420,7 @@ def compute_metrics(pred_quaternion: np.ndarray, pred_translation: np.ndarray, g
         e_star_t_bar = e_t_bar
         e_star_q = eq
         e_star_p = ep
+
     return {
         "et": et,
         "eq": eq,
@@ -342,12 +445,29 @@ def draw_keypoints(
         for index, point in enumerate(gt_keypoints):
             x, y = int(round(point[0])), int(round(point[1]))
             cv2.circle(vis, (x, y), 5, (255, 0, 0), 1)
-            cv2.putText(vis, f"g{index}", (x + 4, y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
+            cv2.putText(
+                vis,
+                f"g{index}",
+                (x + 4, y - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (255, 0, 0),
+                1,
+            )
+
     for index, (point, conf) in enumerate(zip(pred_keypoints, confidences)):
         x, y = int(round(point[0])), int(round(point[1]))
         color = (0, 255, 0) if conf > 0.05 else (0, 0, 255)
         cv2.circle(vis, (x, y), 5, color, -1)
-        cv2.putText(vis, f"p{index}", (x + 4, y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+        cv2.putText(
+            vis,
+            f"p{index}",
+            (x + 4, y - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            color,
+            1,
+        )
     return vis
 
 
@@ -357,7 +477,13 @@ def evaluate(args):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    model = load_checkpoint_model(args.model_path, device)
+    model, resolved_input_size, resolved_heatmap_size = load_checkpoint_model(
+        args.model_path,
+        device,
+        cli_input_size=args.input_size,
+        cli_heatmap_size=args.heatmap_size,
+    )
+
     camera_matrix, dist_coeffs = load_camera(data_root)
     annotations, image_dir = load_annotations(data_root, args.split)
 
@@ -376,8 +502,18 @@ def evaluate(args):
             dist_coeffs,
         )
         visible = visible_keypoints_mask(gt_keypoints_2d, (image.shape[1], image.shape[0]))
-        bbox = compute_expanded_bbox(gt_keypoints_2d, visible, (image.shape[1], image.shape[0]), expand_ratio=1.25)
-        crop_image, gt_crop_coords = crop_and_resize(image, gt_keypoints_2d, bbox, output_size=args.input_size)
+        bbox = compute_expanded_bbox(
+            gt_keypoints_2d,
+            visible,
+            (image.shape[1], image.shape[0]),
+            expand_ratio=1.25,
+        )
+        crop_image, gt_crop_coords = crop_and_resize(
+            image,
+            gt_keypoints_2d,
+            bbox,
+            output_size=resolved_input_size,
+        )
 
         image_tensor = normalize_image(crop_image).unsqueeze(0).to(device)
         with torch.no_grad():
@@ -390,10 +526,16 @@ def evaluate(args):
             use_subpixel=not args.disable_subpixel,
             subpixel_radius=args.subpixel_radius,
         )
+
         crop_coords = crop_coords_hm[0].copy()
-        crop_coords[:, 0] = crop_coords[:, 0] * args.input_size / args.heatmap_size
-        crop_coords[:, 1] = crop_coords[:, 1] * args.input_size / args.heatmap_size
-        image_coords = map_crop_coords_to_image(crop_coords, bbox, crop_size_w=args.input_size, crop_size_h=args.input_size)
+        crop_coords[:, 0] = crop_coords[:, 0] * resolved_input_size / resolved_heatmap_size
+        crop_coords[:, 1] = crop_coords[:, 1] * resolved_input_size / resolved_heatmap_size
+        image_coords = map_crop_coords_to_image(
+            crop_coords,
+            bbox,
+            crop_size_w=resolved_input_size,
+            crop_size_h=resolved_input_size,
+        )
 
         rvec, tvec, debug = solve_pose_robust(
             image_points=image_coords,
@@ -411,13 +553,20 @@ def evaluate(args):
 
         pred_quaternion = rotation_vector_to_quaternion(rvec)
         pred_translation = tvec.reshape(-1)
-        metrics = compute_metrics(pred_quaternion, pred_translation, gt_quaternion.astype(np.float64), gt_translation.astype(np.float64))
+        metrics = compute_metrics(
+            pred_quaternion,
+            pred_translation,
+            gt_quaternion.astype(np.float64),
+            gt_translation.astype(np.float64),
+        )
 
         result = {
             "image_name": annotation["filename"],
             "quaternion_pred": pred_quaternion.tolist(),
             "translation_pred": pred_translation.tolist(),
             "confidences": confidences[0].tolist(),
+            "resolved_input_size": resolved_input_size,
+            "resolved_heatmap_size": resolved_heatmap_size,
             **debug,
             **metrics,
         }
@@ -427,16 +576,25 @@ def evaluate(args):
             vis = draw_keypoints(image, image_coords, confidences[0], gt_keypoints=gt_keypoints_2d)
             vis_path = output_dir / f"vis_{annotation['filename']}"
             cv2.imwrite(str(vis_path), cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
-            crop_vis = draw_keypoints(crop_image, crop_coords, confidences[0], gt_keypoints=gt_crop_coords)
+
+            crop_vis = draw_keypoints(
+                crop_image,
+                crop_coords,
+                confidences[0],
+                gt_keypoints=gt_crop_coords,
+            )
             crop_vis_path = output_dir / f"crop_vis_{annotation['filename']}"
             cv2.imwrite(str(crop_vis_path), cv2.cvtColor(crop_vis, cv2.COLOR_RGB2BGR))
 
+    # Calculate collapse metrics based on the threshold argument
     num_collapsed = int(sum(1 for item in results if item["e_star_p"] > args.collapse_threshold))
 
     summary = {
         "split": args.split,
         "model_path": args.model_path,
         "num_samples": len(results),
+        "resolved_input_size": resolved_input_size,
+        "resolved_heatmap_size": resolved_heatmap_size,
         "collapse_threshold": float(args.collapse_threshold),
         "num_collapsed": num_collapsed,
         "collapse_rate": float(num_collapsed / max(len(results), 1)),
@@ -495,8 +653,8 @@ def parse_args():
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--split", type=str, default="validation")
     parser.add_argument("--output_dir", type=str, default="evaluation_results_dino_heatmap")
-    parser.add_argument("--input_size", type=int, default=384)
-    parser.add_argument("--heatmap_size", type=int, default=96)
+    parser.add_argument("--input_size", type=int, default=None)
+    parser.add_argument("--heatmap_size", type=int, default=None)
     parser.add_argument("--num_vis", type=int, default=20)
     parser.add_argument("--nms_kernel", type=int, default=3)
     parser.add_argument("--disable_nms", action="store_true")
